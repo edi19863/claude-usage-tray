@@ -1,0 +1,10 @@
+tray-error.log
+tray-error.old.log
+*.log
+CLAUDE.md
+reddit-critic.ps1
+check-*.ps1
+read-html*.ps1
+gen-dashboard-test.ps1
+test-dashboard.ps1
+add-bom-restart.ps1
