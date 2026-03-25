@@ -1,92 +1,108 @@
 # Claude Code Usage Tray
 
-A Windows system tray monitor that shows your **Claude Code token usage** in real time — 5-hour window, 7-day total, time to reset, and extra-usage status.
+A lightweight **Windows system tray monitor** for [Claude Code](https://claude.ai/code) — shows your 5h session quota and 7-day quota at a glance, with a full usage dashboard, all without leaving your desktop.
 
-[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/edi19863)
-
-![Tray icon showing usage percentage](.github/preview.png)
+[![PayPal](https://img.shields.io/badge/Donate-PayPal-0070ba?logo=paypal&logoColor=white)](https://www.paypal.me/edi19863)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4?logo=windows)
+![PowerShell](https://img.shields.io/badge/requires-PowerShell%205.1-5391FE?logo=powershell)
+![License](https://img.shields.io/badge/license-MIT-22c55e)
 
 ---
 
-## What it does
+## Features
 
-- Sits in the Windows system tray with a live usage indicator (0–100%)
-- Shows **5h usage**, **7-day usage**, **time to next reset**, and **extra usage** status on hover
-- Reads usage from local Claude Code JSONL logs (`~/.claude/projects/`) — no extra API calls needed for basic stats
-- Optionally refreshes OAuth token to fetch rate-limit data directly from Anthropic's API
-- Sends a desktop notification when you reach 85% and 90% of your quota
-- Saves a 30-day usage history to `~/.claude/claude-usage-history.json`
-- Auto-starts with Windows
+- **Color-coded tray icon** that changes based on quota level (green → orange → red → dark red → grey at 100%)
+- **Right-click menu** with instant summary: current %, reset time, extra-usage status
+- **Full HTML dashboard** with 4 tabs — Today / This Week / This Month / All Time
+- **Reads your local `~/.claude/projects/*.jsonl` files** directly — no Node.js, no ccusage, no external tools
+- **Calls the Anthropic OAuth API** every 5 minutes for official quota %; falls back to cached values on rate limit
+- **Desktop notification** at 85% and 90% usage
 
-### Tray tooltip example
+## Icon colors
 
-```
-Claude Code Usage
-5h:  42%  (847K / 2.0M tokens)
-7d:  18%  (3.6M / 20M tokens)
-Reset in: 2h 14m
-```
+| Color | Usage |
+|-------|-------|
+| Green | 0 – 50% |
+| Orange | 50 – 80% |
+| Red | 80 – 95% |
+| Dark red | 95 – 99% |
+| Dark grey | 100% |
+
+---
+
+## Dashboard
+
+Click **"Usage history..."** from the right-click menu to open the dashboard in your browser.
+
+### Today
+Tokens processed today vs yesterday, sessions active today, and an **hourly bar chart** showing activity across the day.
+
+### This Week / This Month
+Total tokens, active days, peak day, daily average, per-day bar chart, day table.
+
+### All Time
+Quota trend chart (line, with 80%/95% thresholds), range selector (24h / 7d / all), top sessions by token usage, full statistics summary.
 
 ---
 
 ## Requirements
 
-- Windows 10 / 11
-- PowerShell 5.1+ (built into Windows)
-- Node.js (only for `read-ratelimit.js` — optional)
-- Claude Code installed (`~/.claude/` folder must exist)
+- Windows 10 or 11
+- PowerShell 5.1 (built into Windows — no install needed)
+- Claude Code installed and logged in (`~/.claude/.credentials.json` must exist)
 
 ---
 
 ## Installation
 
-1. Clone or download this repo
-2. Run the setup script:
+### Option A — Quick start
 
-```bat
-installa-avvio-automatico.bat
+1. [Download the ZIP](https://github.com/edi19863/claude-code-usage-tray/archive/refs/heads/main.zip) and extract it anywhere
+2. Double-click **`start.vbs`** — the tray icon appears immediately, no console window
+
+### Option B — Auto-start at every login
+
+1. Extract the folder
+2. Double-click **`setup-autostart.bat`** — creates a shortcut in your Windows Startup folder (no admin rights needed)
+
+### Option C — Git clone
+
+```
+git clone https://github.com/edi19863/claude-code-usage-tray.git
 ```
 
-This registers `start.vbs` as a Windows startup task so the tray icon appears automatically on login (no PowerShell window visible).
-
-To start manually right now:
-
-```powershell
-powershell -File claude-tray.ps1
-```
-
----
-
-## How it works
-
-1. Reads `~/.claude/projects/**/*.jsonl` — the same conversation logs Claude Code writes locally
-2. Aggregates token counts by session, hour, and day
-3. Displays the rolling 5-hour and 7-day totals as a percentage of your plan limits
-4. Optionally calls `https://api.anthropic.com/api/oauth/usage` (using your existing Claude Code OAuth token from `~/.claude/.credentials.json`) for authoritative rate-limit data
-
-No API key is required — it reuses the token Claude Code already stores locally.
+Then run `start.vbs`.
 
 ---
 
 ## Files
 
 | File | Description |
-|---|---|
-| `claude-tray.ps1` | Main script — all tray logic, dashboard, history |
-| `read-ratelimit.js` | Node.js helper to read rate-limit headers |
-| `installa-avvio-automatico.bat` | Registers autostart on Windows login |
-| `start.vbs` | Silent launcher (hides the PowerShell window) |
+|------|-------------|
+| `claude-tray.ps1` | Main script — tray icon, menu, dashboard, API polling, JSONL parsing |
+| `start.vbs` | Silent launcher — starts PowerShell without showing a console window |
+| `setup-autostart.bat` | Creates a Windows Startup shortcut for auto-launch at login |
+| `add-bom-restart.ps1` | Dev utility — adds UTF-8 BOM to the script and restarts the tray |
 
 ---
 
-## Support the project
+## Notes
 
-If this saves you from hitting the limit mid-session, consider buying me a coffee ☕
+- **Cost columns are intentionally hidden** — Claude Pro/Max users always have `$0` in their JSONL files.
+- Token counts come from local files only. No data leaves your machine except the API quota call.
+- If the quota API returns a rate limit (429), the last cached values are used silently.
+- The script uses PowerShell 5.1 and requires UTF-8 BOM encoding. If you edit the `.ps1` file manually, run `add-bom-restart.ps1` afterward.
 
-[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/edi19863)
+---
+
+## Support
+
+If this tool saves you from hitting the limit mid-session, consider buying me a coffee.
+
+[![Donate via PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif)](https://www.paypal.me/edi19863)
 
 ---
 
 ## License
 
-MIT
+MIT — do whatever you want with it.

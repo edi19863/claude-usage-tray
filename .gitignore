@@ -1,10 +1,10 @@
-tray-error.log
-tray-error.old.log
-*.log
-CLAUDE.md
-reddit-critic.ps1
+﻿tray-error*.log
 check-*.ps1
-read-html*.ps1
 gen-dashboard-test.ps1
+open-dashboard.ps1
+read-html*.ps1
+read-ratelimit.js
 test-dashboard.ps1
-add-bom-restart.ps1
+reddit-critic.ps1
+CLAUDE.md
+installa-avvio-automatico.bat
