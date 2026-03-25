@@ -2,7 +2,7 @@
 
 A lightweight **Windows system tray monitor** for [Claude Code](https://claude.ai/code) — shows your 5h session quota and 7-day quota at a glance, with a full usage dashboard, all without leaving your desktop.
 
-[![PayPal](https://img.shields.io/badge/Donate-PayPal-0070ba?logo=paypal&logoColor=white)](https://www.paypal.me/DavideAscenzo553)
+[![Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20beer-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/edi1986)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4?logo=windows)
 ![PowerShell](https://img.shields.io/badge/requires-PowerShell%205.1-5391FE?logo=powershell)
 ![License](https://img.shields.io/badge/license-MIT-22c55e)
@@ -97,9 +97,9 @@ Then run `start.vbs`.
 
 ## Support
 
-If this tool saves you from hitting the limit mid-session, consider buying me a coffee.
+If this tool saves you from hitting the limit mid-session, feel free to buy me a beer.
 
-[![Donate via PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif)](https://www.paypal.me/DavideAscenzo553)
+[![Buy me a beer](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/edi1986)
 
 ---
 
