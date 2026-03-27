@@ -49,12 +49,12 @@ function Fmt-Tokens([long]$n) {
     if ($n -ge 1000)    { return "$([math]::Round($n/1000,1))K" }
     return "$n"
 }
+$script:ptZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time")
+function Get-PacificTime { return [System.TimeZoneInfo]::ConvertTimeFromUtc([datetime]::UtcNow, $script:ptZone) }
 function Get-IsPeakHour {
-    # Peak = Mon-Fri 06:00-22:00 Pacific Time (PDT=UTC-7 Mar-Oct, PST=UTC-8 Nov-Feb)
-    $utc    = [datetime]::UtcNow
-    $isDST  = ($utc.Month -ge 3 -and $utc.Month -le 10)
-    $pt     = $utc.AddHours($(if ($isDST) { -7 } else { -8 }))
-    $dow    = [int]$pt.DayOfWeek   # 0=Sun, 6=Sat
+    # Peak = Mon-Fri 06:00-22:00 Pacific Time (DST handled by TimeZoneInfo)
+    $pt  = Get-PacificTime
+    $dow = [int]$pt.DayOfWeek   # 0=Sun, 6=Sat
     return ($dow -ge 1 -and $dow -le 5 -and $pt.Hour -ge 6 -and $pt.Hour -lt 22)
 }
 
@@ -754,9 +754,7 @@ function Build-Menu($stats) {
         Add-Sep
         $euText   = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
         Add-Label $euText
-        $utcNow   = [datetime]::UtcNow
-        $isDST    = ($utcNow.Month -ge 3 -and $utcNow.Month -le 10)
-        $ptNow    = $utcNow.AddHours($(if ($isDST) { -7 } else { -8 }))
+        $ptNow    = Get-PacificTime
         $dow      = [int]$ptNow.DayOfWeek
         $isPeakM  = ($dow -ge 1 -and $dow -le 5 -and $ptNow.Hour -ge 6 -and $ptNow.Hour -lt 22)
         if ($isPeakM) {
