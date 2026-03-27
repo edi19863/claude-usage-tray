@@ -27,6 +27,7 @@ $script:lastIconLevel  = -1
 $script:lastIconHandle = [IntPtr]::Zero
 $script:notified85     = $false
 $script:notified90     = $false
+$script:lastIconPeak   = $false
 
 # ─── Utilità ──────────────────────────────────────────────────────────────────
 function Parse-IsoDate($str) {
@@ -47,6 +48,14 @@ function Fmt-Tokens([long]$n) {
     if ($n -ge 1000000) { return "$([math]::Round($n/1000000,2))M" }
     if ($n -ge 1000)    { return "$([math]::Round($n/1000,1))K" }
     return "$n"
+}
+function Get-IsPeakHour {
+    # Peak = Mon-Fri 06:00-22:00 Pacific Time (PDT=UTC-7 Mar-Oct, PST=UTC-8 Nov-Feb)
+    $utc    = [datetime]::UtcNow
+    $isDST  = ($utc.Month -ge 3 -and $utc.Month -le 10)
+    $pt     = $utc.AddHours($(if ($isDST) { -7 } else { -8 }))
+    $dow    = [int]$pt.DayOfWeek   # 0=Sun, 6=Sat
+    return ($dow -ge 1 -and $dow -le 5 -and $pt.Hour -ge 6 -and $pt.Hour -lt 22)
 }
 
 # ─── Legge JSONL locali (~/.claude/projects/) ────────────────────────────────
@@ -743,8 +752,10 @@ function Build-Menu($stats) {
             Add-Label "  Resets: $rstStr"
         }
         Add-Sep
-        $euText = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
+        $euText   = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
         Add-Label $euText
+        $peakText = if (Get-IsPeakHour) { "  Peak hours: ACTIVE (tokens counted x1)" } else { "  Peak hours: off (tokens at reduced rate)" }
+        Add-Label $peakText
     }
     Add-Sep
     $cacheNote = if ($stats.Cached) { " (cached)" } else { "" }
@@ -768,7 +779,7 @@ function Get-IconLevel([double]$pct) {
     return 0
 }
 
-function New-TrayIcon([double]$maxPct = -1) {
+function New-TrayIcon([double]$maxPct = -1, [bool]$isPeak = $false) {
     $bmp  = New-Object System.Drawing.Bitmap(16,16)
     $g    = [System.Drawing.Graphics]::FromImage($bmp)
     $bg   = if ($maxPct -ge 100) { [System.Drawing.Color]::FromArgb(55,55,55) }     # grigio scuro
@@ -781,6 +792,9 @@ function New-TrayIcon([double]$maxPct = -1) {
     $sf   = New-Object System.Drawing.StringFormat
     $sf.Alignment = $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
     $g.DrawString("CC",$font,[System.Drawing.Brushes]::White,(New-Object System.Drawing.RectangleF(0,0,16,16)),$sf)
+    if ($isPeak) {
+        $g.FillRectangle([System.Drawing.Brushes]::Yellow,(New-Object System.Drawing.RectangleF(12,1,3,3)))
+    }
     $sf.Dispose(); $g.Dispose(); $font.Dispose()
     $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
     $bmp.Dispose()
@@ -817,7 +831,9 @@ function Update-Tray {
     $sp  = if ($null -ne $s.Session.Utilization) { "$($s.Session.Utilization)%" } else { "?" }
     $wp  = if ($null -ne $s.Week.Utilization)    { "$($s.Week.Utilization)%" }    else { "?" }
     $upd = if ($s.LastUpdated) { $s.LastUpdated.ToString("dd/MM HH:mm") } else { "mai" }
-    $text = "Claude  Sess:$sp | Week:$wp | $upd"
+    $isPeak   = Get-IsPeakHour
+    $peakTag  = if ($isPeak) { " | PEAK" } else { " | off-peak" }
+    $text = "Claude  Sess:$sp | Week:$wp$peakTag | $upd"
     $tray.Text = $text.Substring(0,[Math]::Min(127,$text.Length))
 
     $maxPct = [math]::Max(
@@ -825,9 +841,10 @@ function Update-Tray {
         $(if ($null -ne $s.Week.Utilization)    { $s.Week.Utilization }    else { 0 })
     )
     $level = Get-IconLevel $maxPct
-    if ($level -ne $script:lastIconLevel) {
+    if ($level -ne $script:lastIconLevel -or $isPeak -ne $script:lastIconPeak) {
         $script:lastIconLevel = $level
-        $newIcon = New-TrayIcon $maxPct
+        $script:lastIconPeak  = $isPeak
+        $newIcon = New-TrayIcon $maxPct $isPeak
         if ($script:lastIconHandle -ne [IntPtr]::Zero) {
             try { [Win32.NativeMethods]::DestroyIcon($script:lastIconHandle) | Out-Null } catch { }
         }
