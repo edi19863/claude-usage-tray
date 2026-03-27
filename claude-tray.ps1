@@ -754,7 +754,32 @@ function Build-Menu($stats) {
         Add-Sep
         $euText   = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
         Add-Label $euText
-        $peakText = if (Get-IsPeakHour) { "  Peak hours: ACTIVE (tokens counted x1)" } else { "  Peak hours: off (tokens at reduced rate)" }
+        $utcNow   = [datetime]::UtcNow
+        $isDST    = ($utcNow.Month -ge 3 -and $utcNow.Month -le 10)
+        $ptNow    = $utcNow.AddHours($(if ($isDST) { -7 } else { -8 }))
+        $dow      = [int]$ptNow.DayOfWeek
+        $isPeakM  = ($dow -ge 1 -and $dow -le 5 -and $ptNow.Hour -ge 6 -and $ptNow.Hour -lt 22)
+        if ($isPeakM) {
+            # ends today at 22:00 PT
+            $endPT    = $ptNow.Date.AddHours(22)
+            $minLeft  = [math]::Round(($endPT - $ptNow).TotalMinutes)
+            $timeStr  = if ($minLeft -ge 60) { "$([math]::Floor($minLeft/60))h $($minLeft % 60)min" } else { "${minLeft}min" }
+            $peakText = "  Peak hours: ACTIVE  (ends in $timeStr)"
+        } else {
+            # find next Mon-Fri 06:00 PT
+            $next = $ptNow.Date.AddHours(6)
+            if ($ptNow.Hour -ge 22) { $next = $next.AddDays(1) }
+            for ($i = 0; $i -lt 7; $i++) {
+                $d = [int]$next.DayOfWeek
+                if ($d -ge 1 -and $d -le 5) { break }
+                $next = $next.AddDays(1)
+            }
+            $minLeft  = [math]::Round(($next - $ptNow).TotalMinutes)
+            $timeStr  = if ($minLeft -ge 1440) { "$([math]::Floor($minLeft/1440))d $([math]::Floor(($minLeft%1440)/60))h" } `
+                        elseif ($minLeft -ge 60) { "$([math]::Floor($minLeft/60))h $($minLeft % 60)min" } `
+                        else { "${minLeft}min" }
+            $peakText = "  Peak hours: off  (starts in $timeStr)"
+        }
         Add-Label $peakText
     }
     Add-Sep
