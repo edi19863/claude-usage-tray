@@ -52,10 +52,10 @@ function Fmt-Tokens([long]$n) {
 $script:ptZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Pacific Standard Time")
 function Get-PacificTime { return [System.TimeZoneInfo]::ConvertTimeFromUtc([datetime]::UtcNow, $script:ptZone) }
 function Get-IsPeakHour {
-    # Peak = Mon-Fri 06:00-22:00 Pacific Time (DST handled by TimeZoneInfo)
+    # Peak = Mon-Fri 05:00-11:00 PT = 8AM-2PM ET = 12PM-6PM GMT (source: claude2x.com)
     $pt  = Get-PacificTime
     $dow = [int]$pt.DayOfWeek   # 0=Sun, 6=Sat
-    return ($dow -ge 1 -and $dow -le 5 -and $pt.Hour -ge 6 -and $pt.Hour -lt 22)
+    return ($dow -ge 1 -and $dow -le 5 -and $pt.Hour -ge 5 -and $pt.Hour -lt 11)
 }
 
 # ─── Legge JSONL locali (~/.claude/projects/) ────────────────────────────────
@@ -756,17 +756,17 @@ function Build-Menu($stats) {
         Add-Label $euText
         $ptNow    = Get-PacificTime
         $dow      = [int]$ptNow.DayOfWeek
-        $isPeakM  = ($dow -ge 1 -and $dow -le 5 -and $ptNow.Hour -ge 6 -and $ptNow.Hour -lt 22)
+        $isPeakM  = ($dow -ge 1 -and $dow -le 5 -and $ptNow.Hour -ge 5 -and $ptNow.Hour -lt 11)
         if ($isPeakM) {
-            # ends today at 22:00 PT
-            $endPT    = $ptNow.Date.AddHours(22)
+            # ends today at 11:00 PT
+            $endPT    = $ptNow.Date.AddHours(11)
             $minLeft  = [math]::Round(($endPT - $ptNow).TotalMinutes)
             $timeStr  = if ($minLeft -ge 60) { "$([math]::Floor($minLeft/60))h $($minLeft % 60)min" } else { "${minLeft}min" }
             $peakText = "  Peak hours: ACTIVE  (ends in $timeStr)"
         } else {
-            # find next Mon-Fri 06:00 PT
-            $next = $ptNow.Date.AddHours(6)
-            if ($ptNow.Hour -ge 22) { $next = $next.AddDays(1) }
+            # find next Mon-Fri 05:00 PT
+            $next = $ptNow.Date.AddHours(5)
+            if ($ptNow.Hour -ge 11) { $next = $next.AddDays(1) }
             for ($i = 0; $i -lt 7; $i++) {
                 $d = [int]$next.DayOfWeek
                 if ($d -ge 1 -and $d -le 5) { break }
