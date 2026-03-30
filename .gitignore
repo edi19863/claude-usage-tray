@@ -6,5 +6,7 @@ read-html*.ps1
 read-ratelimit.js
 test-dashboard.ps1
 reddit-critic.ps1
+kill-duplicate.ps1
 CLAUDE.md
+.claudeignore
 installa-avvio-automatico.bat

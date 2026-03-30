@@ -815,21 +815,25 @@ function New-TrayIcon([double]$pctSess=0,[double]$pctWeek=0,[bool]$isPeak=$false
     $bmp = New-Object System.Drawing.Bitmap(16,16)
     $g   = [System.Drawing.Graphics]::FromImage($bmp)
     $g.Clear([System.Drawing.Color]::FromArgb(25,25,25))
-    # Barra sessione (righe 0-6)
-    $wS = [math]::Max(1,[math]::Round($pctSess/100*16))
+    # Bordo 1px tutto intorno: giallo durante peak hour, blu fuori peak
+    $borderColor = if ($isPeak) { [System.Drawing.Color]::FromArgb(255,215,0) } else { [System.Drawing.Color]::FromArgb(60,120,255) }
+    $br = New-Object System.Drawing.SolidBrush($borderColor)
+    $g.FillRectangle($br,0,0,16,1)
+    $g.FillRectangle($br,0,15,16,1)
+    $g.FillRectangle($br,0,0,1,16)
+    $g.FillRectangle($br,15,0,1,16)
+    $br.Dispose()
+    # Barra sessione dentro il bordo (righe 1-7, larghezza max 14px)
+    $wS = [math]::Max(1,[math]::Round($pctSess/100*14))
     $br = New-Object System.Drawing.SolidBrush((BarColor $pctSess))
-    $g.FillRectangle($br,0,0,$wS,7); $br.Dispose()
-    # Separatore riga 7
+    $g.FillRectangle($br,1,1,$wS,7); $br.Dispose()
+    # Separatore
     $br = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(10,10,10))
-    $g.FillRectangle($br,0,7,16,1); $br.Dispose()
-    # Barra settimana (righe 8-14)
-    $wW = [math]::Max(1,[math]::Round($pctWeek/100*16))
+    $g.FillRectangle($br,1,8,14,1); $br.Dispose()
+    # Barra settimana (righe 9-14, larghezza max 14px)
+    $wW = [math]::Max(1,[math]::Round($pctWeek/100*14))
     $br = New-Object System.Drawing.SolidBrush((BarColor $pctWeek))
-    $g.FillRectangle($br,0,8,$wW,7); $br.Dispose()
-    # Riga 15: striscia peak (gialla) o scura
-    $pc = if ($isPeak) { [System.Drawing.Color]::FromArgb(255,200,0) } else { [System.Drawing.Color]::FromArgb(20,20,20) }
-    $br = New-Object System.Drawing.SolidBrush($pc)
-    $g.FillRectangle($br,0,15,16,1); $br.Dispose()
+    $g.FillRectangle($br,1,9,$wW,6); $br.Dispose()
     $g.Dispose()
     $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
     $bmp.Dispose()
