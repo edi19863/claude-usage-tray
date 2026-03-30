@@ -750,6 +750,16 @@ function Build-Menu($stats) {
             Add-Label "  Current week (7d)" $true
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
+            if ($rst) {
+                $weekStart   = $rst.AddDays(-7)
+                $elapsedH    = ([datetime]::Now - $weekStart).TotalHours
+                $expectedPct = [math]::Round($elapsedH / 168 * 100, 1)
+                $delta       = [math]::Round($pct - $expectedPct, 1)
+                $paceStr     = if ([math]::Abs($delta) -lt 3) { "(on track)" } `
+                               elseif ($delta -gt 0) { "(+${delta}% over)" } `
+                               else { "($delta% under)" }
+                Add-Label "  On pace: ${expectedPct}%  actual: ${pct}%  $paceStr"
+            }
         }
         Add-Sep
         $euText   = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
@@ -794,31 +804,33 @@ function Build-Menu($stats) {
 }
 
 # ─── Icona tray ───────────────────────────────────────────────────────────────
-function Get-IconLevel([double]$pct) {
-    if ($pct -ge 100) { return 100 }
-    if ($pct -ge 95)  { return 95 }
-    if ($pct -ge 80)  { return 80 }
-    if ($pct -ge 50)  { return 50 }
-    return 0
-}
-
-function New-TrayIcon([double]$maxPct = -1, [bool]$isPeak = $false) {
-    $bmp  = New-Object System.Drawing.Bitmap(16,16)
-    $g    = [System.Drawing.Graphics]::FromImage($bmp)
-    $bg   = if ($maxPct -ge 100) { [System.Drawing.Color]::FromArgb(55,55,55) }     # grigio scuro
-            elseif ($maxPct -ge 95) { [System.Drawing.Color]::FromArgb(100,0,0) }   # rosso scurissimo
-            elseif ($maxPct -ge 80) { [System.Drawing.Color]::FromArgb(200,30,30) } # rosso
-            elseif ($maxPct -ge 50) { [System.Drawing.Color]::FromArgb(200,120,0) } # arancione
-            else  { [System.Drawing.Color]::FromArgb(40,160,65) }                   # verde
-    $g.Clear($bg)
-    $font = New-Object System.Drawing.Font("Arial",6,[System.Drawing.FontStyle]::Bold)
-    $sf   = New-Object System.Drawing.StringFormat
-    $sf.Alignment = $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-    $g.DrawString("CC",$font,[System.Drawing.Brushes]::White,(New-Object System.Drawing.RectangleF(0,0,16,16)),$sf)
-    if ($isPeak) {
-        $g.FillRectangle([System.Drawing.Brushes]::Yellow,(New-Object System.Drawing.RectangleF(12,1,3,3)))
+function New-TrayIcon([double]$pctSess=0,[double]$pctWeek=0,[bool]$isPeak=$false) {
+    function BarColor([double]$p) {
+        if ($p -ge 100) { return [System.Drawing.Color]::FromArgb(55,55,55) }
+        if ($p -ge 95)  { return [System.Drawing.Color]::FromArgb(100,0,0) }
+        if ($p -ge 80)  { return [System.Drawing.Color]::FromArgb(200,30,30) }
+        if ($p -ge 50)  { return [System.Drawing.Color]::FromArgb(200,120,0) }
+        return [System.Drawing.Color]::FromArgb(40,160,65)
     }
-    $sf.Dispose(); $g.Dispose(); $font.Dispose()
+    $bmp = New-Object System.Drawing.Bitmap(16,16)
+    $g   = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::FromArgb(25,25,25))
+    # Barra sessione (righe 0-6)
+    $wS = [math]::Max(1,[math]::Round($pctSess/100*16))
+    $br = New-Object System.Drawing.SolidBrush((BarColor $pctSess))
+    $g.FillRectangle($br,0,0,$wS,7); $br.Dispose()
+    # Separatore riga 7
+    $br = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(10,10,10))
+    $g.FillRectangle($br,0,7,16,1); $br.Dispose()
+    # Barra settimana (righe 8-14)
+    $wW = [math]::Max(1,[math]::Round($pctWeek/100*16))
+    $br = New-Object System.Drawing.SolidBrush((BarColor $pctWeek))
+    $g.FillRectangle($br,0,8,$wW,7); $br.Dispose()
+    # Riga 15: striscia peak (gialla) o scura
+    $pc = if ($isPeak) { [System.Drawing.Color]::FromArgb(255,200,0) } else { [System.Drawing.Color]::FromArgb(20,20,20) }
+    $br = New-Object System.Drawing.SolidBrush($pc)
+    $g.FillRectangle($br,0,15,16,1); $br.Dispose()
+    $g.Dispose()
     $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
     $bmp.Dispose()
     return $icon
@@ -859,15 +871,15 @@ function Update-Tray {
     $text = "Claude  Sess:$sp | Week:$wp$peakTag | $upd"
     $tray.Text = $text.Substring(0,[Math]::Min(127,$text.Length))
 
-    $maxPct = [math]::Max(
-        $(if ($null -ne $s.Session.Utilization) { $s.Session.Utilization } else { 0 }),
-        $(if ($null -ne $s.Week.Utilization)    { $s.Week.Utilization }    else { 0 })
-    )
-    $level = Get-IconLevel $maxPct
-    if ($level -ne $script:lastIconLevel -or $isPeak -ne $script:lastIconPeak) {
-        $script:lastIconLevel = $level
-        $script:lastIconPeak  = $isPeak
-        $newIcon = New-TrayIcon $maxPct $isPeak
+    $sPct   = if ($null -ne $s.Session.Utilization) { [double]$s.Session.Utilization } else { 0.0 }
+    $wPct   = if ($null -ne $s.Week.Utilization)    { [double]$s.Week.Utilization }    else { 0.0 }
+    $maxPct = [math]::Max($sPct, $wPct)
+    $sR = [math]::Round($sPct); $wR = [math]::Round($wPct)
+    if ($sR -ne $script:lastSessPct -or $wR -ne $script:lastWeekPct -or $isPeak -ne $script:lastIconPeak) {
+        $script:lastSessPct  = $sR
+        $script:lastWeekPct  = $wR
+        $script:lastIconPeak = $isPeak
+        $newIcon = New-TrayIcon $sPct $wPct $isPeak
         if ($script:lastIconHandle -ne [IntPtr]::Zero) {
             try { [Win32.NativeMethods]::DestroyIcon($script:lastIconHandle) | Out-Null } catch { }
         }
