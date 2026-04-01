@@ -643,6 +643,19 @@ function Invoke-TokenRefresh([bool]$force = $false) {
     } catch { return $creds }
 }
 
+# ─── Cache stdin (Claude Code status line) ────────────────────────────────────
+$RateLimitCacheFile = Join-Path $env:USERPROFILE ".claude\rate-limits-cache.json"
+function Get-StdinCache {
+    if (-not (Test-Path $RateLimitCacheFile)) { return $null }
+    try {
+        $c = Read-JsonFile $RateLimitCacheFile
+        if (-not $c -or -not $c.cached_at) { return $null }
+        $nowUnix = [long]([datetime]::UtcNow - [datetime]::new(1970,1,1,0,0,0,'Utc')).TotalSeconds
+        if (($nowUnix - [long]$c.cached_at) -gt 600) { return $null }  # stale oltre 10 min
+        return $c
+    } catch { return $null }
+}
+
 # ─── API usage ────────────────────────────────────────────────────────────────
 function Get-UsageStats {
     param([bool]$retried = $false)
@@ -653,6 +666,25 @@ function Get-UsageStats {
         Error       = ""
         LastUpdated = (Get-Date)
     }
+    # Priorità 1: cache stdin da Claude Code (zero OAuth calls)
+    if (-not $retried) {
+        $sc = Get-StdinCache
+        if ($sc) {
+            $result.Session = [ordered]@{
+                Utilization = [math]::Round([double]$sc.five_hour.used_percentage, 1)
+                ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.five_hour.resets_at).LocalDateTime
+            }
+            $result.Week = [ordered]@{
+                Utilization = [math]::Round([double]$sc.seven_day.used_percentage, 1)
+                ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.seven_day.resets_at).LocalDateTime
+            }
+            $result["Source"] = "live"
+            $script:LastGoodStats = $result
+            Save-HistoryEntry $result
+            return $result
+        }
+    }
+    # Priorità 2: cooldown cache OAuth
     $elapsed = ((Get-Date) - $script:LastCallTime).TotalSeconds
     if (-not $retried -and $elapsed -lt $CooldownSec -and $script:LastGoodStats) {
         $cached = [ordered]@{}
@@ -872,9 +904,10 @@ function Update-Tray {
     $sp  = if ($null -ne $s.Session.Utilization) { "$($s.Session.Utilization)%" } else { "?" }
     $wp  = if ($null -ne $s.Week.Utilization)    { "$($s.Week.Utilization)%" }    else { "?" }
     $upd = if ($s.LastUpdated) { $s.LastUpdated.ToString("dd/MM HH:mm") } else { "mai" }
-    $isPeak   = Get-IsPeakHour
-    $peakTag  = if ($isPeak) { " | PEAK" } else { " | off-peak" }
-    $text = "Claude  Sess:$sp | Week:$wp$peakTag | $upd"
+    $isPeak    = Get-IsPeakHour
+    $peakTag   = if ($isPeak) { " | PEAK" } else { " | off-peak" }
+    $sourceTag = if ($s.Source -eq "live") { " [live]" } else { "" }
+    $text = "Claude  Sess:$sp | Week:$wp$peakTag$sourceTag | $upd"
     $tray.Text = $text.Substring(0,[Math]::Min(127,$text.Length))
 
     $sPct   = if ($null -ne $s.Session.Utilization) { [double]$s.Session.Utilization } else { 0.0 }

@@ -1,4 +1,6 @@
 ﻿tray-error*.log
+tray-error*.old.log
+session-event.json
 check-*.ps1
 gen-dashboard-test.ps1
 open-dashboard.ps1
@@ -7,6 +9,8 @@ read-ratelimit.js
 test-dashboard.ps1
 reddit-critic.ps1
 kill-duplicate.ps1
+write-settings.ps1
 CLAUDE.md
 .claudeignore
+.claude/
 installa-avvio-automatico.bat
