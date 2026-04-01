@@ -21,13 +21,15 @@ $ClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 $HistoryMaxDays = 30
 $CooldownSec    = 30
 
-$script:LastGoodStats  = $null
-$script:LastCallTime   = [datetime]::MinValue
-$script:lastIconLevel  = -1
-$script:lastIconHandle = [IntPtr]::Zero
-$script:notified85     = $false
-$script:notified90     = $false
-$script:lastIconPeak   = $false
+$script:LastGoodStats    = $null
+$script:LastCallTime     = [datetime]::MinValue
+$script:lastIconLevel    = -1
+$script:lastIconHandle   = [IntPtr]::Zero
+$script:notified85       = $false
+$script:notified90       = $false
+$script:lastIconPeak     = $false
+$script:lastSessResetsAt = ""
+$SessionEventFile        = Join-Path $PSScriptRoot "session-event.json"
 
 # ─── Utilità ──────────────────────────────────────────────────────────────────
 function Parse-IsoDate($str) {
@@ -737,7 +739,7 @@ function Build-Menu($stats) {
         if ($null -ne $stats.Session.Utilization) {
             $pct = $stats.Session.Utilization; $rst = $stats.Session.ResetsAt
             $mins = if ($rst) { [math]::Round(($rst-(Get-Date)).TotalMinutes) } else { 0 }
-            $rstStr = if (-not $rst) { "?" } elseif ($mins -le 0) { "now" } elseif ($mins -lt 60) { "${mins}min" } else { $rst.ToString("HH:mm") }
+            $rstStr = if (-not $rst) { "?" } elseif ($mins -le 0) { "now" } elseif ($mins -lt 60) { "in ${mins}min" } else { "in $([math]::Floor($mins/60))h $($mins%60)min" }
             Add-Label "  Current session (5h)" $true
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
@@ -899,6 +901,22 @@ function Update-Tray {
     } elseif ($maxPct -lt 75) {
         $script:notified85 = $false; $script:notified90 = $false
     }
+    # Session event file — per trigger agenti esterni
+    $curResetsAt = if ($s.Session.ResetsAt) { $s.Session.ResetsAt.ToString("o") } else { "" }
+    if ($curResetsAt -and $script:lastSessResetsAt -and $curResetsAt -ne $script:lastSessResetsAt) {
+        # ResetsAt cambiato = nuova sessione 5h iniziata
+        try {
+            $evJson = "{`"event`":`"session_reset`",`"timestamp`":`"$([datetime]::Now.ToString('o'))`",`"utilization`":$sPct,`"resetsAt`":`"$curResetsAt`"}"
+            [System.IO.File]::WriteAllText($SessionEventFile, $evJson, [System.Text.Encoding]::UTF8)
+        } catch { }
+    }
+    if ($sPct -ge 95 -and $curResetsAt) {
+        try {
+            $evJson = "{`"event`":`"session_full`",`"timestamp`":`"$([datetime]::Now.ToString('o'))`",`"utilization`":$sPct,`"resetsAt`":`"$curResetsAt`"}"
+            [System.IO.File]::WriteAllText($SessionEventFile, $evJson, [System.Text.Encoding]::UTF8)
+        } catch { }
+    }
+    if ($curResetsAt) { $script:lastSessResetsAt = $curResetsAt }
 }
 Update-Tray
 
