@@ -1,6 +1,8 @@
 ﻿tray-error*.log
 tray-error*.old.log
 session-event.json
+usage-snapshot.json
+_commit_msg.tmp
 check-*.ps1
 gen-dashboard-test.ps1
 open-dashboard.ps1

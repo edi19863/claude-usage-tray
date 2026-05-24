@@ -771,7 +771,8 @@ function Build-Menu($stats) {
         if ($null -ne $stats.Session.Utilization) {
             $pct = $stats.Session.Utilization; $rst = $stats.Session.ResetsAt
             $mins = if ($rst) { [math]::Round(($rst-(Get-Date)).TotalMinutes) } else { 0 }
-            $rstStr = if (-not $rst) { "?" } elseif ($mins -le 0) { "now" } elseif ($mins -lt 60) { "in ${mins}min" } else { "in $([math]::Floor($mins/60))h $($mins%60)min" }
+            $countdown = if (-not $rst) { "?" } elseif ($mins -le 0) { "now" } elseif ($mins -lt 60) { "in ${mins}min" } else { "in $([math]::Floor($mins/60))h $($mins%60)min" }
+            $rstStr = if ($rst) { "$($rst.ToString('HH:mm'))  ($countdown)" } else { "?" }
             Add-Label "  Current session (5h)" $true
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
@@ -950,6 +951,88 @@ function Update-Tray {
         } catch { }
     }
     if ($curResetsAt) { $script:lastSessResetsAt = $curResetsAt }
+
+    # === USAGE SNAPSHOT JSON per consumatori esterni (Maggiordomo bridge) ===
+    # Esporta TUTTI i dati che il menu tasto-destro mostra, in formato
+    # JSON consumabile. Scritto ad ogni Update-Tray (= ogni 5 min + on-demand).
+    try {
+        $snap = [ordered]@{
+            ts            = [datetime]::Now.ToString("o")
+            source        = if ($s.Source) { $s.Source } else { if ($s.Cached) { "cached" } else { "unknown" } }
+            cached        = [bool]$s.Cached
+            error         = if ($s.Error) { $s.Error } else { $null }
+            last_updated  = if ($s.LastUpdated) { $s.LastUpdated.ToString("o") } else { $null }
+            session       = $null
+            week          = $null
+            extra_usage   = [bool]$s.ExtraUsage
+            peak          = $null
+        }
+        if ($null -ne $s.Session.Utilization) {
+            $rst = $s.Session.ResetsAt
+            $rim = if ($rst) { [math]::Round(($rst - (Get-Date)).TotalMinutes) } else { $null }
+            $snap.session = [ordered]@{
+                pct           = [double]$s.Session.Utilization
+                resets_at     = if ($rst) { $rst.ToString("o") } else { $null }
+                resets_in_min = $rim
+            }
+        }
+        if ($null -ne $s.Week.Utilization) {
+            $rst = $s.Week.ResetsAt
+            $wd = [ordered]@{
+                pct             = [double]$s.Week.Utilization
+                resets_at       = if ($rst) { $rst.ToString("o") } else { $null }
+                resets_in_days  = if ($rst) { [math]::Round(($rst - (Get-Date)).TotalDays, 2) } else { $null }
+                expected_pct    = $null
+                delta_pct       = $null
+                pace_label      = $null
+            }
+            if ($rst) {
+                $weekStart   = $rst.AddDays(-7)
+                $elapsedH    = ([datetime]::Now - $weekStart).TotalHours
+                $expectedPct = [math]::Round($elapsedH / 168 * 100, 1)
+                $delta       = [math]::Round([double]$s.Week.Utilization - $expectedPct, 1)
+                $pace = if ([math]::Abs($delta) -lt 3) { "on_track" } `
+                        elseif ($delta -gt 0)         { "over_pace" } `
+                        else                          { "under_pace" }
+                $wd.expected_pct = $expectedPct
+                $wd.delta_pct    = $delta
+                $wd.pace_label   = $pace
+            }
+            $snap.week = $wd
+        }
+        # Peak hours (replica della logica di Build-Menu)
+        $ptNow  = Get-PacificTime
+        $dowPt  = [int]$ptNow.DayOfWeek
+        $isPeak = ($dowPt -ge 1 -and $dowPt -le 5 -and $ptNow.Hour -ge 5 -and $ptNow.Hour -lt 11)
+        $pk = [ordered]@{
+            active                 = [bool]$isPeak
+            label                  = $null
+            minutes_to_next_change = $null
+        }
+        if ($isPeak) {
+            $endPT   = $ptNow.Date.AddHours(11)
+            $minLeft = [math]::Round(($endPT - $ptNow).TotalMinutes)
+            $pk.label = "active_ends_in"
+            $pk.minutes_to_next_change = $minLeft
+        } else {
+            $next = $ptNow.Date.AddHours(5)
+            if ($ptNow.Hour -ge 11) { $next = $next.AddDays(1) }
+            for ($i = 0; $i -lt 7; $i++) {
+                $d = [int]$next.DayOfWeek
+                if ($d -ge 1 -and $d -le 5) { break }
+                $next = $next.AddDays(1)
+            }
+            $minLeft = [math]::Round(($next - $ptNow).TotalMinutes)
+            $pk.label = "off_starts_in"
+            $pk.minutes_to_next_change = $minLeft
+        }
+        $snap.peak = $pk
+
+        $snapPath = Join-Path $PSScriptRoot "usage-snapshot.json"
+        [System.IO.File]::WriteAllText($snapPath, ($snap | ConvertTo-Json -Depth 5), [System.Text.Encoding]::UTF8)
+    } catch {
+        "$([datetime]::Now) snapshot ERRORE: $_" | Out-File $LogFile -Append -Encoding UTF8
+    }
 }
 Update-Tray
 
