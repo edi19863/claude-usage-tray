@@ -22,12 +22,14 @@ $HistoryMaxDays = 30
 $CooldownSec    = 30
 
 $script:LastGoodStats    = $null
+$script:LastFreshTime    = $null   # ultima volta che i dati sono arrivati DAVVERO dall'API/status line (non da cache)
+$script:LoginNeeded      = $false  # true se il token e' scaduto/mancante e il refresh e' fallito: segnale immediato, non serve aspettare
 $script:LastCallTime     = [datetime]::MinValue
+$StaleAfterHours         = 3       # oltre questa eta' l'avviso "dati non aggiornati" compare nel menu
 $script:lastIconLevel    = -1
 $script:lastIconHandle   = [IntPtr]::Zero
 $script:notified85       = $false
 $script:notified90       = $false
-$script:lastIconPeak     = $false
 $script:lastSessResetsAt = ""
 $SessionEventFile        = Join-Path $PSScriptRoot "session-event.json"
 
@@ -45,6 +47,41 @@ function Read-JsonFile($path) {
 }
 function Write-JsonFile($path, $obj) {
     [System.IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
+}
+# Semina la cache in-memory da usage-snapshot.json su disco: evita che un
+# riavvio del processo (crash, watchdog, chiusura manuale) lasci il tray senza
+# alcun dato quando l'API e' temporaneamente in rate-limit e non c'e' ancora
+# nessuna cache fresca in RAM.
+function Seed-LastGoodStats {
+    $snapPath = Join-Path $PSScriptRoot "usage-snapshot.json"
+    $snap = Read-JsonFile $snapPath
+    if (-not $snap -or -not $snap.last_updated) { return }
+    $age = ([datetime]::Now - [datetime]$snap.last_updated).TotalHours
+    if ($age -gt 48) { return }  # troppo vecchio per essere utile come fallback
+    $seeded = [ordered]@{
+        Session     = [ordered]@{
+            Utilization = if ($snap.session) { $snap.session.pct } else { $null }
+            ResetsAt    = if ($snap.session) { Parse-IsoDate $snap.session.resets_at } else { $null }
+        }
+        Week        = [ordered]@{
+            Utilization = if ($snap.week) { $snap.week.pct } else { $null }
+            ResetsAt    = if ($snap.week) { Parse-IsoDate $snap.week.resets_at } else { $null }
+        }
+        Model       = [ordered]@{
+            Name        = if ($snap.model) { $snap.model.name } else { $null }
+            Utilization = if ($snap.model) { $snap.model.pct } else { $null }
+            ResetsAt    = if ($snap.model) { Parse-IsoDate $snap.model.resets_at } else { $null }
+        }
+        ExtraUsage  = $false
+        Error       = ""
+        LastUpdated = [datetime]$snap.last_updated
+        Cached      = $true
+    }
+    # last_fresh_fetch: quando l'ultimo dato VERO (non cache) e' arrivato.
+    # Se lo snapshot e' vecchio (pre-fix) e non ce l'ha, usiamo last_updated
+    # come stima prudente: sara' corretto al primo fetch riuscito.
+    $script:LastFreshTime = if ($snap.last_fresh_fetch) { [datetime]$snap.last_fresh_fetch } else { [datetime]$snap.last_updated }
+    $script:LastGoodStats = $seeded
 }
 function Fmt-Tokens([long]$n) {
     if ($n -ge 1000000) { return "$([math]::Round($n/1000000,2))M" }
@@ -67,7 +104,27 @@ function Get-LocalTokenData {
     $byDate    = @{}
     $bySession = @{}
     $byHour    = @{}
+    $byProject = @{}
+    $sessTitle = @{}
     $todayStr  = (Get-Date).ToString("yyyy-MM-dd")
+    # Dedup: la stessa richiesta puo' comparire su piu' righe JSONL (retry/streaming)
+    $seen  = New-Object 'System.Collections.Generic.HashSet[string]'
+    $cut7   = (Get-Date).Date.AddDays(-7)
+    $cut30  = (Get-Date).Date.AddDays(-30)
+    $cut24h = (Get-Date).AddHours(-24)
+    function Add-MTokEntry($bucket, [string]$model, [long]$inp, [long]$out, [long]$cc, [long]$cr, [bool]$d30, [bool]$d7, [bool]$d24h, [string]$dayStr) {
+        $keys = @('mtok'); if ($d30) { $keys += 'mtok30' }; if ($d7) { $keys += 'mtok7' }; if ($d24h) { $keys += 'mtok24h' }
+        foreach ($k in $keys) {
+            if (-not $bucket[$k][$model]) { $bucket[$k][$model] = @{ inp=0L; out=0L; cc=0L; cr=0L } }
+            $t = $bucket[$k][$model]
+            $t.inp += $inp; $t.out += $out; $t.cc += $cc; $t.cr += $cr
+        }
+        # Bucket per-giorno-calendario (per il filtro "singolo giorno" della dashboard)
+        if (-not $bucket['byDay'][$dayStr]) { $bucket['byDay'][$dayStr] = @{} }
+        if (-not $bucket['byDay'][$dayStr][$model]) { $bucket['byDay'][$dayStr][$model] = @{ inp=0L; out=0L; cc=0L; cr=0L } }
+        $dbt = $bucket['byDay'][$dayStr][$model]
+        $dbt.inp += $inp; $dbt.out += $out; $dbt.cc += $cc; $dbt.cr += $cr
+    }
     try {
         $files = Get-ChildItem $projectsDir -Recurse -Filter "*.jsonl" -ErrorAction SilentlyContinue
         foreach ($file in $files) {
@@ -78,14 +135,29 @@ function Get-LocalTokenData {
                 try {
                     $e = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
                     if (-not $e -or -not $e.timestamp) { continue }
+                    # Titolo sessione: primo messaggio utente testuale nel file (i messaggi utente
+                    # non hanno usage token, quindi va catturato PRIMA del filtro "continue" sotto)
+                    if ($e.sessionId -and $e.type -eq 'user' -and $e.message.role -eq 'user' -and $e.message.content -is [string] -and -not $sessTitle.ContainsKey("$($e.sessionId)")) {
+                        $t = "$($e.message.content)".Trim() -replace '\s+',' '
+                        if ($t) {
+                            if ($t.Length -gt 90) { $t = $t.Substring(0,90) + '...' }
+                            $sessTitle["$($e.sessionId)"] = $t
+                        }
+                    }
                     $usage = $null; try { $usage = $e.message.usage } catch { }
                     $cost  = [double]0; try { if ($null -ne $e.costUSD) { $cost = [double]$e.costUSD } } catch { }
                     if (-not $usage -and $cost -eq 0) { continue }
                     $dt = $null
                     try { $dt = [System.DateTimeOffset]::Parse("$($e.timestamp)",[System.Globalization.CultureInfo]::InvariantCulture).LocalDateTime } catch { continue }
+                    $mid = ""; try { if ($e.message.id) { $mid = "$($e.message.id)" } } catch { }
+                    $rid = ""; try { if ($e.requestId)  { $rid = "$($e.requestId)" } } catch { }
+                    if (($mid -or $rid) -and -not $seen.Add("$mid|$rid")) { continue }
                     $date  = $dt.ToString("yyyy-MM-dd")
                     $sid   = if ($e.sessionId)     { "$($e.sessionId)" }     else { "unknown" }
                     $model = if ($e.message.model) { "$($e.message.model)" } else { "" }
+                    $proj  = ""
+                    try { if ($e.cwd) { $proj = Split-Path "$($e.cwd)" -Leaf } } catch { }
+                    if (-not $proj) { $proj = $file.Directory.Name }
                     $inp=[long]0; $out=[long]0; $cc=[long]0; $cr=[long]0
                     if ($usage) {
                         try { $inp = [long]$usage.input_tokens }                    catch { }
@@ -107,21 +179,35 @@ function Get-LocalTokenData {
                     $byDate[$date].total += $total; $byDate[$date].cost += $cost
                     if ($model) { $byDate[$date].models[$model] = 1 }
                     if (-not $bySession[$sid]) {
-                        $bySession[$sid] = @{ sid=$sid; inp=0L; out=0L; cc=0L; cr=0L; total=0L; cost=0.0; lastTs=$dt; models=@{} }
+                        $bySession[$sid] = @{ sid=$sid; proj=$proj; inp=0L; out=0L; cc=0L; cr=0L; total=0L; cost=0.0; lastTs=$dt; models=@{}; mtok=@{}; mtok30=@{}; mtok7=@{}; mtok24h=@{}; byDay=@{} }
                     }
                     $bySession[$sid].inp   += $inp;  $bySession[$sid].out  += $out
                     $bySession[$sid].cc    += $cc;   $bySession[$sid].cr   += $cr
                     $bySession[$sid].total += $total; $bySession[$sid].cost += $cost
                     if ($dt -gt $bySession[$sid].lastTs) { $bySession[$sid].lastTs = $dt }
                     if ($model) { $bySession[$sid].models[$model] = 1 }
+                    # Token per modello: sessione e progetto (stima costi, finestre 24h/7/30 gg + per-giorno)
+                    if ($model) {
+                        $d30 = $dt -ge $cut30; $d7 = $dt -ge $cut7; $d24h = $dt -ge $cut24h
+                        Add-MTokEntry $bySession[$sid] $model $inp $out $cc $cr $d30 $d7 $d24h $date
+                        if (-not $byProject[$proj]) { $byProject[$proj] = @{ name=$proj; inp=0L; out=0L; cc=0L; cr=0L; total=0L; lastTs=$dt; mtok=@{}; mtok30=@{}; mtok7=@{}; mtok24h=@{}; byDay=@{} } }
+                        $bp = $byProject[$proj]
+                        $bp.inp += $inp; $bp.out += $out; $bp.cc += $cc; $bp.cr += $cr; $bp.total += $total
+                        if ($dt -gt $bp.lastTs) { $bp.lastTs = $dt }
+                        Add-MTokEntry $bp $model $inp $out $cc $cr $d30 $d7 $d24h $date
+                    }
                 } catch { }
             }
         }
     } catch { }
     if ($byDate.Count -eq 0) { return $null }
+    foreach ($k in @($bySession.Keys)) {
+        $bySession[$k].title = if ($sessTitle.ContainsKey($k)) { $sessTitle[$k] } else { "" }
+    }
     $days     = @($byDate.Values | Sort-Object date)
-    $sessions = @($bySession.Values | Sort-Object { $_.total } -Descending | Select-Object -First 20)
-    return @{ Days=$days; Sessions=$sessions; Hours=$byHour }
+    $sessions = @($bySession.Values | Sort-Object { $_.total } -Descending)
+    $projects = @($byProject.Values | Sort-Object { $_.total } -Descending)
+    return @{ Days=$days; Sessions=$sessions; Hours=$byHour; Projects=$projects }
 }
 
 # ─── Storico: salva entry ─────────────────────────────────────────────────────
@@ -142,6 +228,322 @@ function Save-HistoryEntry($stats) {
 }
 
 # ─── Dashboard HTML ───────────────────────────────────────────────────────────
+# ─── Stima costi (prezzi API di listino $/MTok; cache write 1.25x, read 0.1x) ─
+function Get-ModelPrice([string]$model) {
+    if ($model -match 'fable|mythos') { return @{ inp=10.0; out=50.0 } }
+    if ($model -match 'opus')         { return @{ inp=5.0;  out=25.0 } }
+    if ($model -match 'sonnet')       { return @{ inp=3.0;  out=15.0 } }
+    if ($model -match 'haiku')        { return @{ inp=1.0;  out=5.0 } }
+    return @{ inp=5.0; out=25.0 }
+}
+function Get-EstCost([string]$model, [long]$inp, [long]$out, [long]$cc, [long]$cr) {
+    $p = Get-ModelPrice $model
+    return ($inp * $p.inp + $out * $p.out + $cc * $p.inp * 1.25 + $cr * $p.inp * 0.1) / 1000000.0
+}
+function Get-ShortModelName([string]$model) {
+    return ($model -replace '^claude-','' -replace '-\d{8}$','')
+}
+# Costruisce il JS array [{m,c}] dei costi per modello di un bucket con mtok
+function Get-ModelCostJs($mtok) {
+    $parts = @()
+    $tot = 0.0
+    foreach ($m in ($mtok.Keys | Sort-Object)) {
+        if ($m -match '<synthetic>' -or -not $m) { continue }
+        $t = $mtok[$m]
+        $c = Get-EstCost $m $t.inp $t.out $t.cc $t.cr
+        $tot += $c
+        $short = Get-ShortModelName $m
+        $parts += "{m:`"$short`",c:$([math]::Round($c,2))}"
+    }
+    return @{ js = ('[' + ($parts -join ',') + ']'); total = [math]::Round($tot,2) }
+}
+# Costruisce l'oggetto JS {"yyyy-MM-dd":{t:costo,m:[...]}} per il filtro "singolo giorno"
+function Get-ByDayJs($byDay) {
+    if (-not $byDay -or $byDay.Count -eq 0) { return '{}' }
+    $parts = foreach ($day in ($byDay.Keys | Sort-Object -Descending)) {
+        $mc = Get-ModelCostJs $byDay[$day]
+        if ($mc.total -gt 0) { "`"$day`":{t:$($mc.total),m:$($mc.js)}" }
+    }
+    return '{' + (($parts | Where-Object { $_ }) -join ',') + '}'
+}
+
+# ─── Analisi: prezzi reali API ($) + ratio limite settimanale (peso) ─────────
+$script:AnalyticsPriceTable = @{
+    Opus   = @{ pin=15.0; pout=75.0; rin=5;    rout=25 }
+    Sonnet = @{ pin=3.0;  pout=15.0; rin=3;    rout=15 }
+    Haiku  = @{ pin=0.80; pout=4.0;  rin=1;    rout=5 }
+    Fable  = @{ pin=15.0; pout=75.0; rin=10;   rout=50 }
+}
+function Get-ModelTier([string]$model) {
+    if ($model -match 'fable|mythos') { return 'Fable' }
+    if ($model -match 'opus')         { return 'Opus' }
+    if ($model -match 'sonnet')       { return 'Sonnet' }
+    if ($model -match 'haiku')        { return 'Haiku' }
+    return 'Sonnet'
+}
+function Get-AnalyticsData {
+    $projectsDir = Join-Path $env:USERPROFILE ".claude\projects"
+    if (-not (Test-Path $projectsDir)) { return $null }
+
+    $now    = Get-Date
+    $cut24h = $now.AddHours(-24)
+    $cut7   = $now.AddDays(-7)
+    $cut30  = $now.AddDays(-30)
+
+    # Calibrazione: K = %-settimanale-reale / peso della finestra reale (week.resets_at - 7gg)
+    $st = $script:stats
+    $weekPct = $null; $weekResetsAt = $null
+    if ($st -and $st.Week -and $null -ne $st.Week.Utilization) {
+        $weekPct      = [double]$st.Week.Utilization
+        $weekResetsAt = $st.Week.ResetsAt
+    }
+    if ((-not $weekResetsAt) -or $null -eq $weekPct) {
+        $snapPath = Join-Path $PSScriptRoot "usage-snapshot.json"
+        if (Test-Path $snapPath) {
+            $snap = Read-JsonFile $snapPath
+            if ($snap -and $snap.week) {
+                if ($null -ne $snap.week.pct) { $weekPct = [double]$snap.week.pct }
+                if ($snap.week.resets_at) { $weekResetsAt = $snap.week.resets_at }
+            }
+        }
+    }
+    # Normalizza resets_at: puo' essere DateTime (path in-process), unix seconds o stringa ISO (snapshot)
+    if ($weekResetsAt -and $weekResetsAt -isnot [datetime]) {
+        $rv = "$weekResetsAt"
+        if ($rv -match '^\d+$') {
+            try { $weekResetsAt = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$rv).LocalDateTime } catch { $weekResetsAt = $null }
+        } else {
+            try { $weekResetsAt = [System.DateTimeOffset]::Parse($rv, [System.Globalization.CultureInfo]::InvariantCulture).LocalDateTime } catch { $weekResetsAt = $null }
+        }
+    }
+    $windowStart = if ($weekResetsAt -is [datetime]) { $weekResetsAt.AddDays(-7) } else { $null }
+    $weekPeso    = [double]0
+
+    $periods = @{}
+    foreach ($p in @('24h','7d','30d','all')) { $periods[$p] = @{ models=@{}; sessions=@{}; projects=@{} } }
+    $trendBuckets = @{ '24h'=@{}; '7d'=@{}; '30d'=@{}; 'all'=@{} }
+
+    function Add-Analytics($bucket, [string]$tier, [string]$sid, [string]$proj, [long]$inp, [long]$out, [long]$cr, [long]$c5, [long]$c1, [double]$usd, [double]$peso) {
+        $cc = $c5 + $c1
+        if (-not $bucket.models[$tier]) { $bucket.models[$tier] = @{ inp=0L; out=0L; cr=0L; cc=0L; c5=0L; c1=0L; usd=0.0; peso=0.0 } }
+        $m = $bucket.models[$tier]
+        $m.inp += $inp; $m.out += $out; $m.cr += $cr; $m.cc += $cc; $m.c5 += $c5; $m.c1 += $c1; $m.usd += $usd; $m.peso += $peso
+
+        if (-not $bucket.sessions[$sid]) { $bucket.sessions[$sid] = @{ proj=$proj; models=@{}; byModel=@{}; inp=0L; out=0L; cr=0L; cc=0L; usd=0.0; peso=0.0 } }
+        $s = $bucket.sessions[$sid]
+        $s.inp += $inp; $s.out += $out; $s.cr += $cr; $s.cc += $cc; $s.usd += $usd; $s.peso += $peso
+        $s.models[$tier] = 1
+        if ($proj) { $s.proj = $proj }
+        if (-not $s.byModel[$tier]) { $s.byModel[$tier] = @{ inp=0L; out=0L; cr=0L; c5=0L; c1=0L; usd=0.0; peso=0.0 } }
+        $sm = $s.byModel[$tier]
+        $sm.inp += $inp; $sm.out += $out; $sm.cr += $cr; $sm.c5 += $c5; $sm.c1 += $c1; $sm.usd += $usd; $sm.peso += $peso
+
+        if (-not $bucket.projects[$proj]) { $bucket.projects[$proj] = @{ models=@{}; inp=0L; out=0L; cr=0L; cc=0L; usd=0.0; peso=0.0 } }
+        $pr = $bucket.projects[$proj]
+        $pr.inp += $inp; $pr.out += $out; $pr.cr += $cr; $pr.cc += $cc; $pr.usd += $usd; $pr.peso += $peso
+        $pr.models[$tier] = 1
+    }
+
+    function Add-Trend($tb, [string]$key, [string]$tier, [long]$inp, [long]$out, [long]$cr, [long]$c5, [long]$c1, [double]$usd, [double]$peso) {
+        if (-not $tb[$key]) { $tb[$key] = @{ peso=0.0; usd=0.0; cheapPeso=0.0; pesoIn=0.0; pesoOut=0.0; pesoCacheRC=0.0; sumInp=0.0; sumCr=0.0; sumCc=0.0 } }
+        $b = $tb[$key]
+        $b.peso += $peso; $b.usd += $usd
+        if ($tier -eq 'Sonnet' -or $tier -eq 'Haiku') { $b.cheapPeso += $peso }
+        $p = $script:AnalyticsPriceTable[$tier]
+        $b.pesoIn      += $inp * $p.rin / 1000000.0
+        $b.pesoOut     += $out * $p.rout / 1000000.0
+        $b.pesoCacheRC += ($cr*$p.rin*0.10 + $c5*$p.rin*1.25 + $c1*$p.rin*2.00) / 1000000.0
+        $b.sumInp += $inp; $b.sumCr += $cr; $b.sumCc += ($c5 + $c1)
+    }
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    try {
+        $files = Get-ChildItem $projectsDir -Recurse -Filter "*.jsonl" -ErrorAction SilentlyContinue
+        foreach ($file in $files) {
+            $lines = Get-Content $file.FullName -Encoding UTF8 -ErrorAction SilentlyContinue
+            if (-not $lines) { continue }
+            foreach ($line in $lines) {
+                if (-not $line -or $line.Length -lt 10) { continue }
+                try {
+                    $e = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    if (-not $e -or -not $e.timestamp) { continue }
+                    $usage = $null; try { $usage = $e.message.usage } catch { }
+                    if (-not $usage) { continue }
+                    $dt = $null
+                    try { $dt = [System.DateTimeOffset]::Parse("$($e.timestamp)",[System.Globalization.CultureInfo]::InvariantCulture).LocalDateTime } catch { continue }
+                    $mid = ""; try { if ($e.message.id) { $mid = "$($e.message.id)" } } catch { }
+                    $rid = ""; try { if ($e.requestId)  { $rid = "$($e.requestId)" } } catch { }
+                    if (($mid -or $rid) -and -not $seen.Add("$mid|$rid")) { continue }
+                    $model = if ($e.message.model) { "$($e.message.model)" } else { "" }
+                    if (-not $model) { continue }
+                    $sid  = if ($e.sessionId) { "$($e.sessionId)" } else { "unknown" }
+                    $proj = ""
+                    try { if ($e.cwd) { $proj = Split-Path "$($e.cwd)" -Leaf } } catch { }
+                    if (-not $proj) { $proj = $file.Directory.Name }
+
+                    $inp=[long]0; $out=[long]0; $cc=[long]0; $cr=[long]0; $c5=[long]0; $c1=[long]0
+                    try { $inp = [long]$usage.input_tokens }                catch { }
+                    try { $out = [long]$usage.output_tokens }               catch { }
+                    try { $cc  = [long]$usage.cache_creation_input_tokens } catch { }
+                    try { $cr  = [long]$usage.cache_read_input_tokens }     catch { }
+                    if ($usage.cache_creation) {
+                        try { $c5 = [long]$usage.cache_creation.ephemeral_5m_input_tokens } catch { }
+                        try { $c1 = [long]$usage.cache_creation.ephemeral_1h_input_tokens } catch { }
+                    }
+                    if ($c5 -eq 0 -and $c1 -eq 0 -and $cc -gt 0) { $c5 = $cc }
+
+                    $tier  = Get-ModelTier $model
+                    $price = $script:AnalyticsPriceTable[$tier]
+                    $usd  = ($inp*$price.pin + $out*$price.pout + $cr*$price.pin*0.10 + $c5*$price.pin*1.25 + $c1*$price.pin*2.00) / 1000000.0
+                    $peso = ($inp*$price.rin + $out*$price.rout + $cr*$price.rin*0.10 + $c5*$price.rin*1.25 + $c1*$price.rin*2.00) / 1000000.0
+
+                    if ($windowStart -and $dt -ge $windowStart) { $weekPeso += $peso }
+
+                    if ($dt -ge $cut24h) { Add-Analytics $periods['24h'] $tier $sid $proj $inp $out $cr $c5 $c1 $usd $peso }
+                    if ($dt -ge $cut7)   { Add-Analytics $periods['7d']  $tier $sid $proj $inp $out $cr $c5 $c1 $usd $peso }
+                    if ($dt -ge $cut30)  { Add-Analytics $periods['30d'] $tier $sid $proj $inp $out $cr $c5 $c1 $usd $peso }
+                    Add-Analytics $periods['all'] $tier $sid $proj $inp $out $cr $c5 $c1 $usd $peso
+
+                    if ($dt -ge $cut24h) { Add-Trend $trendBuckets['24h'] $dt.ToString("yyyy-MM-dd HH:00") $tier $inp $out $cr $c5 $c1 $usd $peso }
+                    $dayKey = $dt.ToString("yyyy-MM-dd")
+                    if ($dt -ge $cut7)   { Add-Trend $trendBuckets['7d']  $dayKey $tier $inp $out $cr $c5 $c1 $usd $peso }
+                    if ($dt -ge $cut30)  { Add-Trend $trendBuckets['30d'] $dayKey $tier $inp $out $cr $c5 $c1 $usd $peso }
+                    Add-Trend $trendBuckets['all'] $dayKey $tier $inp $out $cr $c5 $c1 $usd $peso
+                } catch { }
+            }
+        }
+    } catch { }
+
+    $K = $null; $calibValid = $false
+    if ($weekPeso -gt 0 -and $weekPct -and $weekPct -gt 0) { $K = $weekPct / $weekPeso; $calibValid = $true }
+
+    function Get-TierMult([string]$tier) {
+        $rout      = $script:AnalyticsPriceTable[$tier].rout
+        $haikuRout = $script:AnalyticsPriceTable['Haiku'].rout
+        return [math]::Round($rout / $haikuRout, 0)
+    }
+
+    function Build-Trend($tb) {
+        $rows = @()
+        # Nota: variabile di loop chiamata $bktKey (non $k) perche' PowerShell e' case-insensitive
+        # sui nomi variabile: $k collide con $K (fattore di calibrazione) dello scope esterno.
+        foreach ($bktKey in ($tb.Keys | Sort-Object)) {
+            $b      = $tb[$bktKey]
+            $peso   = $b.peso
+            $estPct = if ($calibValid) { [math]::Round($peso * $K, 1) } else { $null }
+            $denom  = $b.sumInp + $b.sumCr + $b.sumCc
+            $cacheHitPct  = if ($denom -gt 0) { [math]::Round($b.sumCr/$denom*100,1) } else { 0 }
+            $cheapTierPct = if ($peso -gt 0)  { [math]::Round($b.cheapPeso/$peso*100,1) } else { 0 }
+            $pesoInPct    = if ($peso -gt 0)  { [math]::Round($b.pesoIn/$peso*100,1) } else { 0 }
+            $pesoOutPct   = if ($peso -gt 0)  { [math]::Round($b.pesoOut/$peso*100,1) } else { 0 }
+            $pesoCachePct = if ($peso -gt 0)  { [math]::Round($b.pesoCacheRC/$peso*100,1) } else { 0 }
+            $rows += [ordered]@{
+                label = $bktKey; peso = [math]::Round($peso,2); usd = [math]::Round($b.usd,2); estPct = $estPct
+                cacheHitPct = $cacheHitPct; cheapTierPct = $cheapTierPct
+                pesoInPct = $pesoInPct; pesoOutPct = $pesoOutPct; pesoCachePct = $pesoCachePct
+            }
+        }
+        return $rows
+    }
+
+    function Build-PeriodJson($bucket, $trend) {
+        $totInp=0.0;$totOut=0.0;$totCr=0.0;$totCc=0.0;$totPeso=0.0;$totUsd=0.0
+        $cheapPeso = 0.0
+        $pesoIn=0.0;$pesoOut=0.0;$pesoCache=0.0
+        $models = @()
+        foreach ($tier in @('Opus','Sonnet','Haiku','Fable')) {
+            if (-not $bucket.models[$tier]) { continue }
+            $m = $bucket.models[$tier]
+            if ($m.inp -eq 0 -and $m.out -eq 0 -and $m.cr -eq 0 -and $m.cc -eq 0) { continue }
+            $estPct = if ($calibValid) { [math]::Round($m.peso * $K, 1) } else { $null }
+            $totInp += $m.inp; $totOut += $m.out; $totCr += $m.cr; $totCc += $m.cc; $totPeso += $m.peso; $totUsd += $m.usd
+            if ($tier -eq 'Haiku' -or $tier -eq 'Sonnet') { $cheapPeso += $m.peso }
+            $p = $script:AnalyticsPriceTable[$tier]
+            $pesoIn    += $m.inp * $p.rin / 1000000.0
+            $pesoOut   += $m.out * $p.rout / 1000000.0
+            $pesoCache += ($m.cr*$p.rin*0.10 + $m.c5*$p.rin*1.25 + $m.c1*$p.rin*2.00) / 1000000.0
+            $models += [ordered]@{
+                name = $tier; tierLabel = "$(Get-TierMult $tier)×"
+                input = $m.inp; output = $m.out; cacheRead = $m.cr; cacheCreate = $m.cc
+                cacheCreate5m = $m.c5; cacheCreate1h = $m.c1
+                peso = [math]::Round($m.peso,2); usd = [math]::Round($m.usd,2)
+                estPct = $estPct
+            }
+        }
+        foreach ($mm in $models) { $mm.share = if ($totPeso -gt 0) { [math]::Round($mm.peso / $totPeso * 100, 1) } else { 0 } }
+
+        $sessRows = @()
+        foreach ($sid in $bucket.sessions.Keys) {
+            $s = $bucket.sessions[$sid]
+            $short  = if ($sid.Length -gt 8) { $sid.Substring($sid.Length-8) } else { $sid }
+            $estPct = if ($calibValid) { [math]::Round($s.peso * $K, 1) } else { $null }
+            $modelDetail = @()
+            foreach ($mt in $s.byModel.Keys) {
+                $sm = $s.byModel[$mt]
+                $mEstPct = if ($calibValid) { [math]::Round($sm.peso * $K, 1) } else { $null }
+                $mShare  = if ($s.peso -gt 0) { [math]::Round($sm.peso / $s.peso * 100, 1) } else { 0 }
+                $modelDetail += [pscustomobject]@{ peso=$sm.peso; js=[ordered]@{
+                    name=$mt; tierLabel="$(Get-TierMult $mt)×"
+                    input=$sm.inp; output=$sm.out; cacheRead=$sm.cr
+                    cacheCreate5m=$sm.c5; cacheCreate1h=$sm.c1
+                    peso=[math]::Round($sm.peso,2); usd=[math]::Round($sm.usd,2)
+                    estPct=$mEstPct; share=$mShare
+                }}
+            }
+            $modelDetailSorted = @($modelDetail | Sort-Object peso -Descending | ForEach-Object { $_.js })
+            $sessRows += [pscustomobject]@{ peso=$s.peso; js=[ordered]@{
+                id=$short; fullId=$sid; project=$s.proj; models=@($s.models.Keys | Sort-Object)
+                input=$s.inp; output=$s.out; cacheRead=$s.cr; cacheCreate=$s.cc
+                peso=[math]::Round($s.peso,2); usd=[math]::Round($s.usd,2); estPct=$estPct
+                modelDetail=$modelDetailSorted
+            }}
+        }
+        $sessTop = @($sessRows | Sort-Object peso -Descending | Select-Object -First 15 | ForEach-Object { $_.js })
+
+        $projRows = @()
+        foreach ($pn in $bucket.projects.Keys) {
+            $pr = $bucket.projects[$pn]
+            $estPct = if ($calibValid) { [math]::Round($pr.peso * $K, 1) } else { $null }
+            $projRows += [pscustomobject]@{ peso=$pr.peso; js=[ordered]@{
+                name=$pn; models=@($pr.models.Keys | Sort-Object)
+                input=$pr.inp; output=$pr.out; cacheRead=$pr.cr; cacheCreate=$pr.cc
+                peso=[math]::Round($pr.peso,2); usd=[math]::Round($pr.usd,2); estPct=$estPct
+            }}
+        }
+        $projSorted = @($projRows | Sort-Object peso -Descending | ForEach-Object { $_.js })
+
+        $cacheHitPct  = if (($totInp+$totCr+$totCc) -gt 0) { [math]::Round($totCr/($totInp+$totCr+$totCc)*100,1) } else { 0 }
+        $cheapTierPct = if ($totPeso -gt 0) { [math]::Round($cheapPeso/$totPeso*100,1) } else { 0 }
+        $totEstPct    = if ($calibValid) { [math]::Round($totPeso * $K, 1) } else { $null }
+        $pesoInPct    = if ($totPeso -gt 0) { [math]::Round($pesoIn/$totPeso*100,1) }    else { 0 }
+        $pesoOutPct   = if ($totPeso -gt 0) { [math]::Round($pesoOut/$totPeso*100,1) }   else { 0 }
+        $pesoCachePct = if ($totPeso -gt 0) { [math]::Round($pesoCache/$totPeso*100,1) } else { 0 }
+
+        return [ordered]@{
+            models   = $models
+            sessions = $sessTop
+            projects = $projSorted
+            totals   = [ordered]@{
+                input=$totInp; output=$totOut; cacheRead=$totCr; cacheCreate=$totCc
+                peso=[math]::Round($totPeso,2); usd=[math]::Round($totUsd,2); estPct=$totEstPct
+                cacheHitPct=$cacheHitPct; cheapTierPct=$cheapTierPct
+                pesoInPct=$pesoInPct; pesoOutPct=$pesoOutPct; pesoCachePct=$pesoCachePct
+            }
+            trend    = $trend
+        }
+    }
+
+    $result = [ordered]@{
+        calib = [ordered]@{
+            K = $K; weekPct = $weekPct
+            windowStart = if ($windowStart) { $windowStart.ToString("o") } else { $null }
+            valid = $calibValid
+        }
+    }
+    foreach ($p in @('24h','7d','30d','all')) { $result[$p] = Build-PeriodJson $periods[$p] (Build-Trend $trendBuckets[$p]) }
+    return $result
+}
+
 function Show-HistoryChart {
   try {
     $history = @()
@@ -154,9 +556,10 @@ function Show-HistoryChart {
         if ($ts) { "{ts:`"$ts`",sess:$s,week:$w}" }
     }) -join ','
 
-    $localData = Get-LocalTokenData
-    $days      = if ($localData) { @($localData.Days     | Sort-Object { $_.date }) } else { @() }
-    $sessions  = if ($localData) { @($localData.Sessions | Sort-Object { $_.total } -Descending | Select-Object -First 15) } else { @() }
+    $localData   = Get-LocalTokenData
+    $days        = if ($localData) { @($localData.Days     | Sort-Object { $_.date }) } else { @() }
+    $allSessions = if ($localData) { @($localData.Sessions | Sort-Object { $_.total } -Descending) } else { @() }
+    $sessions    = @($allSessions | Select-Object -First 15)
 
     $jsDays = if ($days.Count) {
         '[' + (($days | ForEach-Object {
@@ -179,6 +582,33 @@ function Show-HistoryChart {
         }) -join ',') + ']'
     } else { '[]' }
 
+    # Costi stimati per sessione e per progetto, con finestre 7/30 giorni e totale.
+    # Usa TUTTE le sessioni (non il top-15 per token storici): altrimenti una sessione
+    # piccola nel totale ma attiva negli ultimi 7gg sparirebbe anche da quella vista.
+    $jsSessCost = if ($allSessions.Count) {
+        $rows = foreach ($s in $allSessions) {
+            if (-not $s.mtok -or $s.mtok.Count -eq 0) { continue }
+            $mcA = Get-ModelCostJs $s.mtok; $mc30 = Get-ModelCostJs $s.mtok30; $mc7 = Get-ModelCostJs $s.mtok7; $mc24h = Get-ModelCostJs $s.mtok24h; $byDayJs = Get-ByDayJs $s.byDay
+            $sidShort = if ("$($s.sid)".Length -gt 8) { "$($s.sid)".Substring(0,8) } else { "$($s.sid)" }
+            $lts = if ($s.lastTs) { $s.lastTs.ToString("o") } else { '' }
+            $pj  = "$($s.proj)" -replace '["\\]',''
+            $ttl = if ($s.title) { "$($s.title)" -replace '["\\]','' -replace "[\r\n]",' ' } else { '' }
+            [pscustomobject]@{ total = $mcA.total; js = "{sid:`"$sidShort`",title:`"$ttl`",proj:`"$pj`",lastTs:`"$lts`",t_all:$($mcA.total),m_all:$($mcA.js),t_30:$($mc30.total),m_30:$($mc30.js),t_7:$($mc7.total),m_7:$($mc7.js),t_24h:$($mc24h.total),m_24h:$($mc24h.js),byDay:$byDayJs}" }
+        }
+        '[' + ((@($rows) | Sort-Object total -Descending | ForEach-Object { $_.js }) -join ',') + ']'
+    } else { '[]' }
+    $projList = if ($localData -and $localData.Projects) { @($localData.Projects) } else { @() }
+    $jsProjCost = if ($projList.Count) {
+        $rows = foreach ($p2 in $projList) {
+            if (-not $p2.mtok -or $p2.mtok.Count -eq 0) { continue }
+            $mcA = Get-ModelCostJs $p2.mtok; $mc30 = Get-ModelCostJs $p2.mtok30; $mc7 = Get-ModelCostJs $p2.mtok7; $mc24h = Get-ModelCostJs $p2.mtok24h; $byDayJs = Get-ByDayJs $p2.byDay
+            $nm = "$($p2.name)" -replace '["\\]',''
+            $lts = if ($p2.lastTs) { $p2.lastTs.ToString("o") } else { '' }
+            [pscustomobject]@{ total = $mcA.total; js = "{name:`"$nm`",lastTs:`"$lts`",t_all:$($mcA.total),m_all:$($mcA.js),t_30:$($mc30.total),m_30:$($mc30.js),t_7:$($mc7.total),m_7:$($mc7.js),t_24h:$($mc24h.total),m_24h:$($mc24h.js),byDay:$byDayJs}" }
+        }
+        '[' + ((@($rows) | Sort-Object total -Descending | ForEach-Object { $_.js }) -join ',') + ']'
+    } else { '[]' }
+
     $jsHours = '[' + ((0..23 | ForEach-Object {
         $h2 = $_; $hd = if ($localData -and $localData.Hours) { $localData.Hours[$h2] } else { $null }
         if ($hd) { [long]$hd.inp + [long]$hd.out } else { 0 }
@@ -194,15 +624,22 @@ function Show-HistoryChart {
     $lastUpd    = if ($st -and $st.LastUpdated) { $st.LastUpdated.ToString("MM/dd/yyyy HH:mm:ss") } else { "never" }
     $isCached   = if ($st.Cached) { " (cached)" } else { "" }
 
-    function ColU($v) {
+    function ColU($v, $resetsAt, [double]$windowHours) {
+        # Colore basato sullo scostamento dal ritmo atteso (pacing), non sul valore assoluto:
+        # verde = sotto il previsto, giallo = in linea/leggermente sopra, rosso = pesantemente sopra.
         if ($null -eq $v)  { return '#44aa66' }
-        if ($v -ge 95)     { '#7a0000' }
-        elseif ($v -ge 80) { '#cc2222' }
-        elseif ($v -ge 50) { '#cc8800' }
-        else               { '#44aa66' }
+        if ($v -ge 95)     { return '#7a0000' }  # quasi esaurito: allarme indipendente dal ritmo
+        $pace = if ($resetsAt -and $windowHours) { Get-Pace ([double]$v) $resetsAt $windowHours } else { $null }
+        if (-not $pace) {
+            # fallback su soglie assolute se manca il dato per calcolare il ritmo atteso
+            if ($v -ge 80) { return '#cc2222' } elseif ($v -ge 50) { return '#cc8800' } else { return '#44aa66' }
+        }
+        if ($pace.Delta -le -1)    { '#44aa66' }
+        elseif ($pace.Delta -le 7) { '#cc8800' }
+        else                       { '#cc2222' }
     }
-    $sessColor = ColU $sessU
-    $weekColor = ColU $weekU
+    $sessColor = ColU $sessU $st.Session.ResetsAt 5
+    $weekColor = ColU $weekU $st.Week.ResetsAt 168
 
     $sessReset = if ($st.Session.ResetsAt) {
         $m = [math]::Round(($st.Session.ResetsAt - (Get-Date)).TotalMinutes)
@@ -242,6 +679,15 @@ function Show-HistoryChart {
     $hasLocal    = if ($days.Count -gt 0) { 'true' } else { 'false' }
     $count       = $history.Count
     $daysCount   = $days.Count
+
+    $analyticsData = Get-AnalyticsData
+    if (-not $analyticsData) {
+        $analyticsData = [ordered]@{ calib = [ordered]@{ K=$null; weekPct=$null; windowStart=$null; valid=$false } }
+        foreach ($p in @('24h','7d','30d','all')) {
+            $analyticsData[$p] = [ordered]@{ models=@(); sessions=@(); projects=@(); trend=@(); totals=[ordered]@{ input=0;output=0;cacheRead=0;cacheCreate=0;peso=0;usd=0;estPct=$null;cacheHitPct=0;cheapTierPct=0;pesoInPct=0;pesoOutPct=0;pesoCachePct=0 } }
+        }
+    }
+    $analyticsJson = $analyticsData | ConvertTo-Json -Depth 10 -Compress
 
     $html = @"
 <!DOCTYPE html>
@@ -304,6 +750,7 @@ tr:hover td{background:var(--bg3)}
 .sr:last-child{border-bottom:none}
 .sk{color:var(--muted)}.sv{font-weight:600}
 .nodata{text-align:center;padding:28px;color:var(--muted);font-size:.84rem}
+.hint{cursor:help;opacity:.5;font-size:.85em;margin-left:4px}
 </style>
 </head>
 <body>
@@ -332,6 +779,9 @@ tr:hover td{background:var(--bg3)}
   <button class="tab" data-tab="week" onclick="switchTab('week')">This Week</button>
   <button class="tab" data-tab="month" onclick="switchTab('month')">This Month</button>
   <button class="tab" data-tab="history" onclick="switchTab('history')">All Time</button>
+  <button class="tab" data-tab="costs" onclick="switchTab('costs')">Costs</button>
+  <button class="tab" data-tab="analisi" onclick="switchTab('analisi')">Analisi</button>
+  <button class="tab" data-tab="grafici" onclick="switchTab('grafici')">Grafici</button>
 </nav>
 
 <!-- TODAY -->
@@ -443,11 +893,103 @@ tr:hover td{background:var(--bg3)}
   </div>
 </div>
 
+<!-- COSTS -->
+<div id="tab-costs" class="panel">
+  <div class="sec">
+    <div class="st">Estimated cost by session</div>
+    <div class="ss">Equivalent cost at API list prices (input + output + cache write 1.25x + cache read 0.1x). Deduplicated by message/request ID. On the Max plan you do not pay per token &mdash; this shows what the usage would be worth on the API.</div>
+    <div class="range" style="display:flex;gap:8px;align-items:center;margin:6px 0 10px;flex-wrap:wrap">
+      <button class="rtab" data-w="24h" onclick="setCostWindow('24h')">Last 24h</button>
+      <button class="rtab active" data-w="7" onclick="setCostWindow(7)">Last 7 days</button>
+      <button class="rtab" data-w="30" onclick="setCostWindow(30)">Last 30 days</button>
+      <button class="rtab" data-w="all" onclick="setCostWindow('all')">All time</button>
+      <input id="costDay" type="date" value="$today" style="background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font-size:.78rem;color:var(--text);font-family:inherit" onchange="setCostWindow('day')">
+      <input id="costFilter" type="text" placeholder="Filter session/project..." style="margin-left:auto;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:.78rem;color:var(--text);font-family:inherit" oninput="renderCostTables()">
+    </div>
+    <div id="tblSessCost"></div>
+  </div>
+  <div class="sec">
+    <div class="st">Estimated cost by project</div>
+    <div class="ss">Same estimate, aggregated by project directory across all sessions in the selected window.</div>
+    <div id="tblProjCost"></div>
+  </div>
+</div>
+
+<!-- ANALISI -->
+<div id="tab-analisi" class="panel">
+  <div class="ss" style="margin-bottom:10px">Stime: la % del limite &egrave; calibrata sul consumo settimanale reale ma approssimata; il ranking relativo &egrave; esatto. I &#36; sono prezzi API pubblici, NON una spesa reale (piano Max).</div>
+  <div class="ss" id="aCalibNote" style="display:none;color:var(--orange);margin-bottom:10px">Calibrazione non disponibile: apri Claude Code per aggiornare i rate_limits.</div>
+  <div class="rbar">
+    <button class="rtab" data-p="24h" onclick="setAnalyticsPeriod('24h')">24h</button>
+    <button class="rtab active" data-p="7d" onclick="setAnalyticsPeriod('7d')">7d</button>
+    <button class="rtab" data-p="30d" onclick="setAnalyticsPeriod('30d')">30d</button>
+    <button class="rtab" data-p="all" onclick="setAnalyticsPeriod('all')">All</button>
+  </div>
+  <div class="krow">
+    <div class="kpi"><div class="kl">Peso periodo<span class="hint" title="Di quanto hai eroso il limite settimanale nel periodo selezionato (stima calibrata sul consumo reale).">&#9432;</span></div><div class="kv blu" id="aK1">--</div><div class="ks" id="aK1s">&nbsp;</div></div>
+    <div class="kpi"><div class="kl">Cache hit<span class="hint" title="Quota di input gia' servita da cache invece di essere riletta da zero: piu' alta = piu' risparmio automatico.">&#9432;</span></div><div class="kv" id="aK2">--</div><div class="ks">quota input da cache</div></div>
+    <div class="kpi"><div class="kl">Tier economico<span class="hint" title="Quota di lavoro (in peso) andata su Sonnet/Haiku invece di Opus/Fable: piu' alta = routing verso i modelli piu' economici sta funzionando.">&#9432;</span></div><div class="kv pur" id="aK3">--</div><div class="ks">quota lavoro su Sonnet/Haiku</div></div>
+    <div class="kpi"><div class="kl">Split<span class="hint" title="Come si distribuisce il peso consumato tra input nuovo, output generato e riletture di cache. Se la cache domina, il costo dipende dalla lunghezza delle sessioni, non da quanto scrivi o quanto risponde Claude.">&#9432;</span></div><div id="aSplit">--</div><div class="ks">dove va il peso</div></div>
+  </div>
+  <div class="sec">
+    <div class="st">Per modello</div>
+    <div id="tblAModels"></div>
+  </div>
+  <div class="sec">
+    <div class="st">Top sessioni (15)</div>
+    <div id="tblASessions"></div>
+  </div>
+  <div class="sec">
+    <div class="st">Per progetto</div>
+    <div id="tblAProjects"></div>
+  </div>
+  <div class="sec">
+    <div class="st">Simulatore &quot;E se...&quot;<span class="hint" title="Simula cosa succederebbe al tuo consumo se spostassi il lavoro oggi su Opus verso un modello piu' economico, a parita' di token generati.">&#9432;</span></div>
+    <div class="ss">Mix attuale (peso per modello): <span id="aSimMix">--</span></div>
+    <div class="rbar">
+      <button class="rtab simbtn" data-sim="Sonnet" onclick="simSet('Sonnet')">Tutto l'Opus &rarr; Sonnet</button>
+      <button class="rtab simbtn" data-sim="Haiku" onclick="simSet('Haiku')">Tutto l'Opus &rarr; Haiku</button>
+      <button class="rtab" onclick="simReset()">Reset</button>
+    </div>
+    <div id="aSimResult"></div>
+  </div>
+</div>
+
+<!-- GRAFICI -->
+<div id="tab-grafici" class="panel">
+  <div class="ss" style="margin-bottom:10px">Andamento nel tempo dei KPI della tab Analisi.</div>
+  <div class="rbar">
+    <button class="rtab" data-gp="24h" onclick="setGraficiPeriod('24h')">24h</button>
+    <button class="rtab active" data-gp="7d" onclick="setGraficiPeriod('7d')">7d</button>
+    <button class="rtab" data-gp="30d" onclick="setGraficiPeriod('30d')">30d</button>
+    <button class="rtab" data-gp="all" onclick="setGraficiPeriod('all')">All</button>
+  </div>
+  <div class="sec">
+    <div class="st">Peso periodo</div>
+    <div id="gPeso"></div>
+  </div>
+  <div class="sec">
+    <div class="st">Cache hit %</div>
+    <div id="gCache"></div>
+  </div>
+  <div class="sec">
+    <div class="st">Tier economico %</div>
+    <div id="gTier"></div>
+  </div>
+  <div class="sec">
+    <div class="st">Split peso (In / Out / Cache)</div>
+    <div id="gSplit"></div>
+  </div>
+</div>
+
 <script>
 var ALL_DATA=[$jsRows];
 var DAYS=$jsDays;
 var SESSIONS=$jsSessions;
 var HOURS=$jsHours;
+var SESSCOST=$jsSessCost;
+var PROJCOST=$jsProjCost;
+var ANALYTICS=$analyticsJson;
 var TODAY='$today';
 var HAS_LOCAL=$hasLocal;
 var STATS={sAvg:$sAvg,sMax:$sMax,wAvg:$wAvg,wMax:$wMax,totalTk:$totalTk,avgDayTk:$avgDayTk,count:$count,peakDate:'$peakDateStr',peakTk:$peakTkVal,weekTk:$weekTk,monthTk:$monthTk,todayTk:$todayTk,yestTk:$yestTk};
@@ -480,7 +1022,7 @@ var inited={};
 function switchTab(id){
   document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('active',t.dataset.tab===id);});
   document.querySelectorAll('.panel').forEach(function(p){p.classList.toggle('active',p.id==='tab-'+id);});
-  if(!inited[id]){inited[id]=true;({today:initToday,week:initWeek,month:initMonth,history:initHistory})[id]();}
+  if(!inited[id]){inited[id]=true;({today:initToday,week:initWeek,month:initMonth,history:initHistory,costs:initCosts,analisi:initAnalytics,grafici:initGrafici})[id]();}
 }
 
 function initToday(){
@@ -593,6 +1135,317 @@ function initHistory(){
   setRange(1);
 }
 
+var COST_WINDOW=7;
+function costWindowKeys(){
+  if(COST_WINDOW==='24h')return{t:'t_24h',m:'m_24h'};
+  if(COST_WINDOW===7)return{t:'t_7',m:'m_7'};
+  if(COST_WINDOW===30)return{t:'t_30',m:'m_30'};
+  if(COST_WINDOW==='day')return null;
+  return{t:'t_all',m:'m_all'};
+}
+function mkCostTable(el,arr,kind,filterText){
+  var k=costWindowKeys();
+  var rows=arr.map(function(r){
+    if(COST_WINDOW==='day'){
+      var day=(g('costDay')&&g('costDay').value)||'';
+      var d=(r.byDay&&day&&r.byDay[day])||{t:0,m:[]};
+      return{r:r,total:d.t,models:d.m};
+    }
+    return{r:r,total:r[k.t],models:r[k.m]};
+  }).filter(function(x){return x.total>0;});
+  if(filterText){
+    var ft=filterText.toLowerCase();
+    rows=rows.filter(function(x){
+      var hay=(kind==='sid'?(x.r.sid+' '+(x.r.proj||'')):x.r.name).toLowerCase();
+      return hay.indexOf(ft)>=0;
+    });
+  }
+  rows.sort(function(a,b){return b.total-a.total;});
+  if(!rows.length){el.innerHTML='<div class="nodata">No cost data for this window.</div>';return;}
+  var h='<table><thead><tr><th>'+(kind==='sid'?'Session':'Project')+'</th><th class="num">Est. cost</th><th>By model</th><th>Last active</th></tr></thead><tbody>';
+  rows.forEach(function(x){
+    var r=x.r;
+    var parts=x.models.map(function(m){return m.m+' <strong>'+'&#36;'+m.c.toFixed(2)+'</strong>';}).join(' &middot; ');
+    var lbl=(kind==='sid')?((r.title?r.title:('Session&nbsp;'+r.sid))+(r.proj?(' <span style="color:#888">&middot; '+r.proj+'</span>'):'')):r.name;
+    h+='<tr><td>'+lbl+'</td><td class="num"><strong>'+'&#36;'+x.total.toFixed(2)+'</strong></td><td style="color:#888">'+parts+'</td><td style="color:#888">'+fmtTs(r.lastTs)+'</td></tr>';
+  });
+  el.innerHTML=h+'</tbody></table>';
+}
+function renderCostTables(){
+  var ft=(g('costFilter')&&g('costFilter').value)||'';
+  mkCostTable(g('tblSessCost'),SESSCOST,'sid',ft);
+  mkCostTable(g('tblProjCost'),PROJCOST,'proj',ft);
+}
+function setCostWindow(w){
+  COST_WINDOW=w;
+  document.querySelectorAll('#tab-costs .rtab').forEach(function(t){t.classList.toggle('active',t.dataset.w==(''+w));});
+  renderCostTables();
+}
+function initCosts(){
+  renderCostTables();
+}
+var AN_PERIOD='7d';
+var AN_SIM=null;
+var AN_PRICES={
+  Opus:{pin:15,pout:75,rin:5,rout:25},
+  Sonnet:{pin:3,pout:15,rin:3,rout:15},
+  Haiku:{pin:0.80,pout:4,rin:1,rout:5},
+  Fable:{pin:15,pout:75,rin:10,rout:50}
+};
+function fmtN2(v){return(v==null||isNaN(v))?'-':Number(v).toFixed(2);}
+function fmtP1(v){return(v==null||isNaN(v))?'-':Number(v).toFixed(1)+'%';}
+
+function setAnalyticsPeriod(p){
+  AN_PERIOD=p;
+  document.querySelectorAll('#tab-analisi .rbar .rtab').forEach(function(t){if(t.dataset.p)t.classList.toggle('active',t.dataset.p===p);});
+  renderAnalytics();
+}
+function initAnalytics(){renderAnalytics();}
+function renderAnalytics(){
+  var d=ANALYTICS[AN_PERIOD];
+  if(!d)return;
+  var calib=ANALYTICS.calib;
+  var note=g('aCalibNote');
+  if(note)note.style.display=calib.valid?'none':'block';
+  st('aK1',calib.valid?('≈'+fmtP1(d.totals.estPct)):'-');
+  st('aK1s','peso '+fmtN2(d.totals.peso)+' · $'+fmtN2(d.totals.usd));
+  var chEl=g('aK2');if(chEl){chEl.textContent=fmtP1(d.totals.cacheHitPct);chEl.className='kv '+(d.totals.cacheHitPct>70?'grn':'');}
+  st('aK3',fmtP1(d.totals.cheapTierPct));
+  var pin=d.totals.pesoInPct||0,pout=d.totals.pesoOutPct||0,pc=d.totals.pesoCachePct||0;
+  var splitEl=g('aSplit');
+  if(splitEl){
+    splitEl.innerHTML='<div style="display:flex;height:10px;border-radius:4px;overflow:hidden;background:var(--bg3)"><div style="width:'+pin.toFixed(1)+'%;background:#3b82f6"></div><div style="width:'+pout.toFixed(1)+'%;background:#f59e0b"></div><div style="width:'+pc.toFixed(1)+'%;background:#a855f7"></div></div><div style="font-size:.68rem;color:#888;margin-top:4px">In '+pin.toFixed(0)+'% · Out '+pout.toFixed(0)+'% · Cache '+pc.toFixed(0)+'%</div>';
+  }
+  renderModelsTable(d);
+  renderSessionsTable(d);
+  renderProjectsTable(d);
+  renderSimulator(d);
+}
+function renderModelsTable(d){
+  var el=g('tblAModels');
+  if(!d.models.length){el.innerHTML='<div class="nodata">No data.</div>';return;}
+  var h='<table><thead><tr><th>Modello</th><th class="num">Peso rel.<span class="hint" title="Moltiplicatore di peso rispetto ad Haiku (1x): Opus pesa 5 volte un token Haiku, Fable 10 volte.">&#9432;</span></th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache(read)</th><th class="num">Peso</th><th class="num">% limite<span class="hint" title="Stima di quanto quella riga pesa sul limite settimanale del piano. Il numero assoluto e\' approssimato, il confronto tra righe e\' affidabile.">&#9432;</span></th><th class="num">$<span class="hint" title="Costo stimato come se pagassi a consumo via API: NON e\' una spesa reale sul piano Max, e\' solo un riferimento di scala.">&#9432;</span></th><th class="num">Share%</th></tr></thead><tbody>';
+  d.models.forEach(function(m){
+    h+='<tr><td>'+m.name+'</td><td class="num">'+m.tierLabel+'</td><td class="num">'+fmtTk(m.input)+'</td><td class="num">'+fmtTk(m.output)+'</td><td class="num">'+fmtTk(m.cacheRead)+'</td><td class="num">'+fmtN2(m.peso)+'</td><td class="num">'+(m.estPct!=null?fmtP1(m.estPct):'-')+'</td><td class="num">$'+fmtN2(m.usd)+'</td><td class="num">'+fmtP1(m.share)+'</td></tr>';
+  });
+  el.innerHTML=h+'</tbody></table>';
+}
+function renderSessionsTable(d){
+  var el=g('tblASessions');
+  if(!d.sessions.length){el.innerHTML='<div class="nodata">No data.</div>';return;}
+  var h='<table><thead><tr><th>Sessione</th><th>Progetto</th><th>Modelli</th><th class="num">Peso</th><th class="num">% limite<span class="hint" title="Stima di quanto quella riga pesa sul limite settimanale del piano. Il numero assoluto e\' approssimato, il confronto tra righe e\' affidabile.">&#9432;</span></th><th class="num">$<span class="hint" title="Costo stimato come se pagassi a consumo via API: NON e\' una spesa reale sul piano Max, e\' solo un riferimento di scala.">&#9432;</span></th><th>Apri</th></tr></thead><tbody>';
+  d.sessions.forEach(function(s,i){
+    var fid=encodeURIComponent(s.fullId||'');
+    var openLinks='<a href="http://100.110.76.42:5000/chat/'+fid+'" target="_blank" title="Apri in Friday" style="text-decoration:none;margin-left:6px;opacity:.7" onclick="event.stopPropagation()">🌐</a>'+
+      '<a href="claude://resume?session='+fid+'" title="Riprendi in Claude Desktop" style="text-decoration:none;margin-left:6px;opacity:.7" onclick="event.stopPropagation()">💬</a>';
+    h+='<tr class="sessRow" style="cursor:pointer" onclick="toggleSessDetail('+i+')"><td><span id="sessArrow'+i+'" style="display:inline-block;width:1em;color:#888">&#9656;</span>'+s.id+'</td><td>'+(s.project||'--')+'</td><td style="color:#888;font-size:.78rem">'+s.models.join(', ')+'</td><td class="num">'+fmtN2(s.peso)+'</td><td class="num">'+(s.estPct!=null?fmtP1(s.estPct):'-')+'</td><td class="num">$'+fmtN2(s.usd)+'</td><td>'+openLinks+'</td></tr>';
+    h+='<tr class="sessDetailRow" id="sessDetail'+i+'" style="display:none"><td colspan="7" style="padding:0">'+renderSessDetailHtml(s)+'</td></tr>';
+  });
+  el.innerHTML=h+'</tbody></table>';
+}
+function renderSessDetailHtml(s){
+  var md=s.modelDetail||[];
+  if(!md.length){return '<div class="nodata" style="margin:6px 24px">Nessun dettaglio.</div>';}
+  var h='<table style="margin:6px 0 6px 24px;width:calc(100% - 24px);background:var(--bg3)"><thead><tr><th>Modello</th><th class="num">Peso rel.</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache(read)</th><th class="num">Peso</th><th class="num">% limite</th><th class="num">$</th><th class="num">Share%</th></tr></thead><tbody>';
+  md.forEach(function(m){
+    h+='<tr><td>'+m.name+'</td><td class="num">'+m.tierLabel+'</td><td class="num">'+fmtTk(m.input)+'</td><td class="num">'+fmtTk(m.output)+'</td><td class="num">'+fmtTk(m.cacheRead)+'</td><td class="num">'+fmtN2(m.peso)+'</td><td class="num">'+(m.estPct!=null?fmtP1(m.estPct):'-')+'</td><td class="num">$'+fmtN2(m.usd)+'</td><td class="num">'+fmtP1(m.share)+'</td></tr>';
+  });
+  return h+'</tbody></table>';
+}
+function toggleSessDetail(i){
+  var row=g('sessDetail'+i);
+  var arrow=g('sessArrow'+i);
+  if(!row)return;
+  var show=row.style.display==='none';
+  row.style.display=show?'table-row':'none';
+  if(arrow)arrow.innerHTML=show?'&#9662;':'&#9656;';
+}
+function renderProjectsTable(d){
+  var el=g('tblAProjects');
+  if(!d.projects.length){el.innerHTML='<div class="nodata">No data.</div>';return;}
+  var h='<table><thead><tr><th>Progetto</th><th>Modelli</th><th class="num">Peso</th><th class="num">% limite<span class="hint" title="Stima di quanto quella riga pesa sul limite settimanale del piano. Il numero assoluto e\' approssimato, il confronto tra righe e\' affidabile.">&#9432;</span></th><th class="num">$<span class="hint" title="Costo stimato come se pagassi a consumo via API: NON e\' una spesa reale sul piano Max, e\' solo un riferimento di scala.">&#9432;</span></th></tr></thead><tbody>';
+  d.projects.forEach(function(p){
+    h+='<tr><td>'+p.name+'</td><td style="color:#888;font-size:.78rem">'+p.models.join(', ')+'</td><td class="num">'+fmtN2(p.peso)+'</td><td class="num">'+(p.estPct!=null?fmtP1(p.estPct):'-')+'</td><td class="num">$'+fmtN2(p.usd)+'</td></tr>';
+  });
+  el.innerHTML=h+'</tbody></table>';
+}
+function calcModelUsdPeso(tier,inp,out,cr,c5,c1){
+  var p=AN_PRICES[tier];
+  var usd=(inp*p.pin+out*p.pout+cr*p.pin*0.10+c5*p.pin*1.25+c1*p.pin*2.00)/1e6;
+  var peso=(inp*p.rin+out*p.rout+cr*p.rin*0.10+c5*p.rin*1.25+c1*p.rin*2.00)/1e6;
+  return{usd:usd,peso:peso};
+}
+function renderSimulator(d){
+  var mixEl=g('aSimMix');
+  if(mixEl)mixEl.innerHTML=d.models.map(function(m){return m.name+': '+fmtN2(m.peso);}).join(' &middot; ')||'--';
+  var resEl=g('aSimResult');
+  if(!resEl)return;
+  var opus=d.models.find(function(m){return m.name==='Opus';});
+  var calib=ANALYTICS.calib;
+  // Baseline ricalcolato con la stessa formula del backend (split cache 5m/1h) cosi'
+  // da coincidere con ANALYTICS[periodo].totals.peso ed evitare delta fasulli.
+  var baseline=d.models.reduce(function(acc,m){
+    var r=calcModelUsdPeso(m.name,m.input,m.output,m.cacheRead,m.cacheCreate5m,m.cacheCreate1h);
+    acc.peso+=r.peso;acc.usd+=r.usd;return acc;
+  },{peso:0,usd:0});
+  var baseEstPct=calib.valid?(baseline.peso*calib.K):null;
+  if(!AN_SIM||!opus){
+    resEl.innerHTML='<div class="ss">Nessuna simulazione attiva. Peso attuale: '+fmtN2(baseline.peso)+' &middot; $'+fmtN2(baseline.usd)+(calib.valid?(' &middot; '+fmtP1(baseEstPct)):'')+'</div>';
+    return;
+  }
+  var opusCalc=calcModelUsdPeso('Opus',opus.input,opus.output,opus.cacheRead,opus.cacheCreate5m,opus.cacheCreate1h);
+  var sim=calcModelUsdPeso(AN_SIM,opus.input,opus.output,opus.cacheRead,opus.cacheCreate5m,opus.cacheCreate1h);
+  var newTotalPeso=baseline.peso-opusCalc.peso+sim.peso;
+  var newTotalUsd=baseline.usd-opusCalc.usd+sim.usd;
+  var deltaPeso=newTotalPeso-baseline.peso;
+  var deltaPct=baseline.peso?(deltaPeso/baseline.peso*100):0;
+  var newEstPct=calib.valid?(newTotalPeso*calib.K):null;
+  resEl.innerHTML=
+    '<div class="ss">Simulazione: Opus &rarr; '+AN_SIM+'</div>'+
+    '<div class="sr"><span class="sk">Peso attuale</span><span class="sv">'+fmtN2(baseline.peso)+'</span></div>'+
+    '<div class="sr"><span class="sk">Peso simulato</span><span class="sv">'+fmtN2(newTotalPeso)+'</span></div>'+
+    '<div class="sr"><span class="sk">&Delta; peso</span><span class="sv '+(deltaPeso<0?'dn':'up')+'">'+(deltaPeso>=0?'+':'')+fmtN2(deltaPeso)+' ('+(deltaPct>=0?'+':'')+deltaPct.toFixed(1)+'%)</span></div>'+
+    '<div class="sr"><span class="sk">$ attuale &rarr; simulato</span><span class="sv">$'+fmtN2(baseline.usd)+' &rarr; $'+fmtN2(newTotalUsd)+'</span></div>'+
+    (calib.valid?('<div class="sr"><span class="sk">% limite attuale &rarr; simulato</span><span class="sv">'+fmtP1(baseEstPct)+' &rarr; '+fmtP1(newEstPct)+'</span></div>'):'');
+}
+function simSet(target){
+  AN_SIM=target;
+  document.querySelectorAll('#tab-analisi .simbtn').forEach(function(b){b.classList.toggle('active',b.dataset.sim===target);});
+  renderSimulator(ANALYTICS[AN_PERIOD]);
+}
+function simReset(){
+  AN_SIM=null;
+  document.querySelectorAll('#tab-analisi .simbtn').forEach(function(b){b.classList.remove('active');});
+  renderSimulator(ANALYTICS[AN_PERIOD]);
+}
+
+function pathFromPts(pts){
+  return pts.map(function(p,i){return(i===0?'M':'L')+p.x.toFixed(1)+','+p.y.toFixed(1);}).join(' ');
+}
+function weightedMovingAvg(data,valueKey,windowRadius){
+  return data.map(function(d,i){
+    var lo=Math.max(0,i-windowRadius),hi=Math.min(data.length-1,i+windowRadius);
+    var sumW=0,sumWV=0;
+    for(var j=lo;j<=hi;j++){
+      var w=data[j].peso>0?data[j].peso:0.001;
+      sumW+=w;sumWV+=w*data[j][valueKey];
+    }
+    return sumW>0?sumWV/sumW:data[i][valueKey];
+  });
+}
+function ptsFromValues(values,min,max,W,H,padL,padR,padT,padB){
+  var n=values.length;
+  var xStep=(W-padL-padR)/(n-1);
+  return values.map(function(v,i){
+    var x=padL+i*xStep;
+    var y=padT+(H-padT-padB)*(1-((v-min)/((max-min)||1)));
+    return{x:x,y:y,v:v};
+  });
+}
+function renderLineChart(containerId,data,opts){
+  var el=g(containerId);
+  if(!el)return;
+  if(!data||data.length<2){el.innerHTML='<div class="nodata">Dati insufficienti per il grafico in questo periodo.</div>';return;}
+  var key=opts.yKey,color=opts.color||'#3b82f6';
+  var vals=data.map(function(d){return d[key]==null?0:d[key];});
+  var lineVals=opts.weightByPeso?weightedMovingAvg(data,key,1):vals;
+  var dataMin=Math.min.apply(null,lineVals),dataMax=Math.max.apply(null,lineVals);
+  var range=(dataMax-dataMin)||dataMax||1;
+  var margin=range*0.1;
+  var min=dataMin-margin,max=dataMax+margin;
+  if(opts.pct){min=Math.max(0,min);max=Math.min(100,max);}
+  else{min=Math.max(0,min);}
+  if(max===min)max=min+1;
+  var rawMin=Math.min.apply(null,vals),rawMax=Math.max.apply(null,vals);
+  if(rawMin<min)min=rawMin;
+  if(rawMax>max)max=rawMax;
+  if(opts.pct){min=Math.max(0,min);max=Math.min(100,max);}
+  if(max===min)max=min+1;
+  var W=600,H=150,padL=42,padR=10,padT=10,padB=22;
+  var pts=ptsFromValues(lineVals,min,max,W,H,padL,padR,padT,padB);
+  var rawPts=ptsFromValues(vals,min,max,W,H,padL,padR,padT,padB);
+  var linePath=pathFromPts(pts);
+  var areaPts=[{x:pts[0].x,y:H-padB}].concat(pts).concat([{x:pts[pts.length-1].x,y:H-padB}]);
+  var areaPath=pathFromPts(areaPts)+' Z';
+  var pesoMax=opts.weightByPeso?Math.max.apply(null,data.map(function(d){return d.peso==null?0:d.peso;})):0;
+  var circles=rawPts.map(function(p,i){
+    var r=2.3,fo=1;
+    if(opts.weightByPeso){
+      var vol=data[i].peso==null?0:data[i].peso;
+      var volRatio=pesoMax>0?(vol/pesoMax):1;
+      r=1.5+volRatio*2.5;
+      fo=0.25+volRatio*0.75;
+    }
+    return'<circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="'+r.toFixed(2)+'" fill="'+color+'" fill-opacity="'+fo.toFixed(2)+'"><title>'+data[i].label+': '+p.v+(opts.weightByPeso?' (peso '+(data[i].peso==null?0:data[i].peso)+')':'')+'</title></circle>';
+  }).join('');
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:150px;display:block">'+
+    '<line x1="'+padL+'" y1="'+padT+'" x2="'+padL+'" y2="'+(H-padB)+'" stroke="#3a3a3a"/>'+
+    '<line x1="'+padL+'" y1="'+(H-padB)+'" x2="'+(W-padR)+'" y2="'+(H-padB)+'" stroke="#3a3a3a"/>'+
+    '<path d="'+areaPath+'" fill="'+color+'" opacity="0.15"/>'+
+    '<path d="'+linePath+'" fill="none" stroke="'+color+'" stroke-width="2"/>'+
+    circles+
+    '<text x="2" y="'+(padT+8)+'" font-size="9" fill="#888">'+max.toFixed(1)+'</text>'+
+    '<text x="2" y="'+(H-padB)+'" font-size="9" fill="#888">'+min.toFixed(1)+'</text>'+
+    '<text x="'+padL+'" y="'+(H-4)+'" font-size="9" fill="#888">'+data[0].label+'</text>'+
+    '<text x="'+(W-padR)+'" y="'+(H-4)+'" font-size="9" fill="#888" text-anchor="end">'+data[data.length-1].label+'</text>'+
+    '</svg>';
+  el.innerHTML=svg;
+}
+function renderStackedChart(containerId,data,series){
+  var el=g(containerId);
+  if(!el)return;
+  if(!data||data.length<2){el.innerHTML='<div class="nodata">Dati insufficienti per il grafico in questo periodo.</div>';return;}
+  var W=600,H=150,padL=10,padR=10,padT=10,padB=22;
+  var n=data.length;
+  var xStep=(W-padL-padR)/(n-1);
+  var cum=data.map(function(){return 0;});
+  var paths='';
+  series.forEach(function(s){
+    var top=[],bottom=[];
+    data.forEach(function(d,i){
+      var v=d[s.key]==null?0:d[s.key];
+      var x=padL+i*xStep;
+      var y0=H-padB-(H-padT-padB)*(cum[i]/100);
+      cum[i]+=v;
+      var y1=H-padB-(H-padT-padB)*(cum[i]/100);
+      top.push({x:x,y:y1});
+      bottom.push({x:x,y:y0});
+    });
+    var d2=pathFromPts(top.concat(bottom.slice().reverse()))+' Z';
+    paths+='<path d="'+d2+'" fill="'+s.color+'" opacity="0.78"/>';
+  });
+  var legend=series.map(function(s){return'<span class="dot" style="background:'+s.color+'"></span>'+s.label;}).join(' &nbsp; ');
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:150px;display:block">'+
+    '<line x1="'+padL+'" y1="'+(H-padB)+'" x2="'+(W-padR)+'" y2="'+(H-padB)+'" stroke="#3a3a3a"/>'+
+    paths+
+    '<text x="'+padL+'" y="'+(H-4)+'" font-size="9" fill="#888">'+data[0].label+'</text>'+
+    '<text x="'+(W-padR)+'" y="'+(H-4)+'" font-size="9" fill="#888" text-anchor="end">'+data[data.length-1].label+'</text>'+
+    '</svg>';
+  el.innerHTML=svg+'<div class="legend">'+legend+'</div>';
+}
+var GN_PERIOD='7d';
+function setGraficiPeriod(p){
+  GN_PERIOD=p;
+  document.querySelectorAll('#tab-grafici .rbar .rtab').forEach(function(t){if(t.dataset.gp)t.classList.toggle('active',t.dataset.gp===p);});
+  renderGrafici();
+}
+function initGrafici(){renderGrafici();}
+function renderGrafici(){
+  var d=ANALYTICS[GN_PERIOD];
+  if(!d)return;
+  var trend=d.trend||[];
+  var calib=ANALYTICS.calib;
+  var pesoKey=calib.valid?'estPct':'peso';
+  renderLineChart('gPeso',trend,{yKey:pesoKey,color:'#3b82f6',label:calib.valid?'% limite':'peso'});
+  renderLineChart('gCache',trend,{yKey:'cacheHitPct',pct:true,weightByPeso:true,color:'#22c55e'});
+  renderLineChart('gTier',trend,{yKey:'cheapTierPct',pct:true,weightByPeso:true,color:'#a855f7'});
+  renderStackedChart('gSplit',trend,[
+    {key:'pesoInPct',color:'#3b82f6',label:'In'},
+    {key:'pesoOutPct',color:'#f59e0b',label:'Out'},
+    {key:'pesoCachePct',color:'#a855f7',label:'Cache'}
+  ]);
+}
+
 inited['today']=true;
 initToday();
 </script>
@@ -602,7 +1455,9 @@ initToday();
 
     $htmlPath = Join-Path $env:TEMP "claude-usage-dashboard.html"
     [System.IO.File]::WriteAllText($htmlPath, $html, [System.Text.Encoding]::UTF8)
-    Start-Process $htmlPath
+    # explorer.exe apre il file nel contesto della shell utente:
+    # funziona anche se il tray gira in un contesto ristretto
+    Start-Process explorer.exe -ArgumentList "`"$htmlPath`""
   } catch {
     "$([datetime]::Now) Show-HistoryChart ERRORE: $_`n$($_.ScriptStackTrace)" | Out-File $LogFile -Append -Encoding UTF8
   }
@@ -662,6 +1517,7 @@ function Get-UsageStats {
     $result = [ordered]@{
         Session     = [ordered]@{}
         Week        = [ordered]@{}
+        Model       = [ordered]@{}
         ExtraUsage  = $false
         Error       = ""
         LastUpdated = (Get-Date)
@@ -679,7 +1535,13 @@ function Get-UsageStats {
                 ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.seven_day.resets_at).LocalDateTime
             }
             $result["Source"] = "live"
+            # La cache stdin non ha il limite per-modello: riusa l'ultimo noto
+            if ($script:LastGoodStats -and $script:LastGoodStats.Model -and $null -ne $script:LastGoodStats.Model.Utilization) {
+                $result.Model = $script:LastGoodStats.Model
+            }
             $script:LastGoodStats = $result
+            $script:LastFreshTime = Get-Date
+            $script:LoginNeeded   = $false
             Save-HistoryEntry $result
             return $result
         }
@@ -695,7 +1557,7 @@ function Get-UsageStats {
     $script:LastCallTime = Get-Date
     try {
         $creds = Invoke-TokenRefresh
-        if (-not $creds -or -not $creds.accessToken) { $result.Error = "Nessun token trovato"; return $result }
+        if (-not $creds -or -not $creds.accessToken) { $result.Error = "Nessun token trovato"; $script:LoginNeeded = $true; return $result }
         $resp = Invoke-WebRequest `
             -Uri "https://api.anthropic.com/api/oauth/usage" `
             -Method Get `
@@ -718,14 +1580,35 @@ function Get-UsageStats {
                 ResetsAt    = Parse-IsoDate $data.seven_day.resets_at
             }
         }
+        # Risposta 200 ma senza dati utilizzabili (visto in pratica: five_hour/seven_day
+        # presenti ma con resets_at nullo, o assenti del tutto) - NON e' un successo:
+        # tratta come fallimento cosi' il ramo sotto ricade sulla cache invece di
+        # sovrascriverla con zeri.
+        if (-not $result.Session.ResetsAt -or -not $result.Week.ResetsAt) {
+            throw "Risposta API incompleta (five_hour/seven_day senza resets_at)"
+        }
         if ($data.extra_usage -and $null -ne $data.extra_usage.is_enabled) {
             $result.ExtraUsage = [bool]$data.extra_usage.is_enabled
+        }
+        # Limite settimanale scoped sul modello principale (es. Fable):
+        # arriva dall'array "limits" con kind=weekly_scoped e scope.model
+        if ($data.limits) {
+            $scoped = $data.limits | Where-Object { $_.kind -eq 'weekly_scoped' -and $_.scope -and $_.scope.model } | Select-Object -First 1
+            if ($scoped) {
+                $mName = if ($scoped.scope.model.display_name) { $scoped.scope.model.display_name } else { "Model" }
+                $result.Model = [ordered]@{
+                    Name        = $mName
+                    Utilization = [math]::Round([double]$scoped.percent,1)
+                    ResetsAt    = Parse-IsoDate $scoped.resets_at
+                }
+            }
         }
     } catch {
         $msg = $_.Exception.Message
         if ($msg -match "401" -and -not $retried) {
             $nc = Invoke-TokenRefresh -force $true
             if ($nc) { return Get-UsageStats -retried $true }
+            $script:LoginNeeded = $true  # refresh forzato fallito: serve login manuale, segnalalo subito
         }
         # Rate limit o qualsiasi errore: restituisce cache se disponibile
         if ($script:LastGoodStats) {
@@ -740,15 +1623,39 @@ function Get-UsageStats {
     }
     if (-not $result.Error) {
         $script:LastGoodStats = $result
+        $script:LastFreshTime = Get-Date
+        $script:LoginNeeded   = $false  # una chiamata reale e' andata a buon fine: il problema, se c'era, e' risolto
         Save-HistoryEntry $result
     }
     return $result
+}
+
+# ─── Login OAuth ──────────────────────────────────────────────────────────────
+$script:DoLogin = {
+    Start-Process -FilePath "cmd.exe" -ArgumentList "/k claude auth login"
+}
+function Get-DataAgeHours {
+    if (-not $script:LastFreshTime) { return [double]::PositiveInfinity }
+    return ((Get-Date) - $script:LastFreshTime).TotalHours
 }
 
 # ─── Barra testo ──────────────────────────────────────────────────────────────
 function Draw-Bar([double]$pct, [int]$width = 18) {
     $filled = [math]::Max(0,[math]::Min($width,[math]::Round($pct/100*$width)))
     return "[" + ("=" * $filled) + (" " * ($width-$filled)) + "]"
+}
+
+# ─── Stima andamento (pace) su una finestra temporale ─────────────────────────
+function Get-Pace([double]$pct, $resetsAt, [double]$windowHours) {
+    if (-not $resetsAt) { return $null }
+    $start    = $resetsAt.AddHours(-$windowHours)
+    $elapsedH = ([datetime]::Now - $start).TotalHours
+    $expected = [math]::Round([math]::Max(0,[math]::Min(100, $elapsedH / $windowHours * 100)), 1)
+    $delta    = [math]::Round($pct - $expected, 1)
+    $label    = if ([math]::Abs($delta) -lt 3) { "(on track)" } `
+                elseif ($delta -gt 0)          { "(+${delta}% over)" } `
+                else                           { "($delta% under)" }
+    return [pscustomobject]@{ Expected=$expected; Delta=$delta; Label=$label }
 }
 
 # ─── Menu contestuale ─────────────────────────────────────────────────────────
@@ -776,6 +1683,8 @@ function Build-Menu($stats) {
             Add-Label "  Current session (5h)" $true
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
+            $pace = Get-Pace $pct $rst 5
+            if ($pace) { Add-Label "  On pace: $($pace.Expected)%  actual: ${pct}%  $($pace.Label)" }
         }
         Add-Sep
         if ($null -ne $stats.Week.Utilization) {
@@ -795,6 +1704,16 @@ function Build-Menu($stats) {
                                else { "($delta% under)" }
                 Add-Label "  On pace: ${expectedPct}%  actual: ${pct}%  $paceStr"
             }
+        }
+        if ($stats.Model -and $null -ne $stats.Model.Utilization) {
+            Add-Sep
+            $pct = $stats.Model.Utilization; $rst = $stats.Model.ResetsAt
+            $rstStr = if ($rst) { $rst.ToString("ddd MM/dd  HH:mm") } else { "?" }
+            Add-Label "  $($stats.Model.Name) week (7d)" $true
+            Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
+            Add-Label "  Resets: $rstStr"
+            $pace = Get-Pace $pct $rst 168
+            if ($pace) { Add-Label "  On pace: $($pace.Expected)%  actual: ${pct}%  $($pace.Label)" }
         }
         Add-Sep
         $euText   = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
@@ -829,23 +1748,37 @@ function Build-Menu($stats) {
     $cacheNote = if ($stats.Cached) { " (cached)" } else { "" }
     Add-Label ("  Updated: {0:HH:mm:ss}{1}" -f $stats.LastUpdated, $cacheNote)
     Add-Sep
+    $dataAge = Get-DataAgeHours
+    if ($script:LoginNeeded -or $dataAge -gt $StaleAfterHours) {
+        $ageLabel = if ([double]::IsInfinity($dataAge)) { "sconosciuta" } else { "$([math]::Round($dataAge,1))h" }
+        $miStale = New-Object System.Windows.Forms.ToolStripMenuItem
+        $miStale.Text = if ($script:LoginNeeded) { "  Token scaduto - Rinnova login" } else { "  Dati non aggiornati da $ageLabel - Rinnova login" }
+        $menu.Items.Add($miStale) | Out-Null
+        $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+    } else {
+        $miStale = $null
+    }
     $miHistory = New-Object System.Windows.Forms.ToolStripMenuItem; $miHistory.Text = "  Usage history..."
     $menu.Items.Add($miHistory) | Out-Null
+    $miLedger = New-Object System.Windows.Forms.ToolStripMenuItem; $miLedger.Text = "  Modello x Effort (ledger)"
+    $menu.Items.Add($miLedger) | Out-Null
     $miRefresh = New-Object System.Windows.Forms.ToolStripMenuItem; $miRefresh.Text = "  Refresh now"
     $menu.Items.Add($miRefresh) | Out-Null
     $miExit = New-Object System.Windows.Forms.ToolStripMenuItem; $miExit.Text = "  Exit"
     $menu.Items.Add($miExit) | Out-Null
-    return [pscustomobject]@{ Menu=$menu; History=$miHistory; Refresh=$miRefresh; Exit=$miExit }
+    return [pscustomobject]@{ Menu=$menu; History=$miHistory; Ledger=$miLedger; Refresh=$miRefresh; Exit=$miExit; Stale=$miStale }
 }
 
 # ─── Icona tray ───────────────────────────────────────────────────────────────
-function New-TrayIcon([double]$pctSess=0,[double]$pctWeek=0,[bool]$isPeak=$false) {
-    function BarColor([double]$p) {
+function New-TrayIcon([double]$pctSess=0,[double]$deltaSess=0,[double]$pctWeek=0,[double]$deltaWeek=0,[bool]$isPeak=$false,$pctFable=$null,$deltaFable=0) {
+    # Colore per scostamento dal ritmo atteso: verde sotto il previsto, giallo in linea/poco sopra,
+    # rosso pesantemente sopra. Soglie assolute (95/100) restano come allarme "quasi esaurito".
+    function BarColor([double]$p,[double]$delta) {
         if ($p -ge 100) { return [System.Drawing.Color]::FromArgb(55,55,55) }
         if ($p -ge 95)  { return [System.Drawing.Color]::FromArgb(100,0,0) }
-        if ($p -ge 80)  { return [System.Drawing.Color]::FromArgb(200,30,30) }
-        if ($p -ge 50)  { return [System.Drawing.Color]::FromArgb(200,120,0) }
-        return [System.Drawing.Color]::FromArgb(40,160,65)
+        if ($delta -le -1) { return [System.Drawing.Color]::FromArgb(40,160,65) }
+        if ($delta -le 7)  { return [System.Drawing.Color]::FromArgb(200,120,0) }
+        return [System.Drawing.Color]::FromArgb(200,30,30)
     }
     $bmp = New-Object System.Drawing.Bitmap(16,16)
     $g   = [System.Drawing.Graphics]::FromImage($bmp)
@@ -858,17 +1791,23 @@ function New-TrayIcon([double]$pctSess=0,[double]$pctWeek=0,[bool]$isPeak=$false
     $g.FillRectangle($br,0,0,1,16)
     $g.FillRectangle($br,15,0,1,16)
     $br.Dispose()
-    # Barra sessione dentro il bordo (righe 1-7, larghezza max 14px)
+    $sepColor = [System.Drawing.Color]::FromArgb(10,10,10)
+    # Barra sessione (righe 1-4, larghezza max 14px)
     $wS = [math]::Max(1,[math]::Round($pctSess/100*14))
-    $br = New-Object System.Drawing.SolidBrush((BarColor $pctSess))
-    $g.FillRectangle($br,1,1,$wS,7); $br.Dispose()
-    # Separatore
-    $br = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(10,10,10))
-    $g.FillRectangle($br,1,8,14,1); $br.Dispose()
-    # Barra settimana (righe 9-14, larghezza max 14px)
+    $br = New-Object System.Drawing.SolidBrush((BarColor $pctSess $deltaSess))
+    $g.FillRectangle($br,1,1,$wS,4); $br.Dispose()
+    $br = New-Object System.Drawing.SolidBrush($sepColor); $g.FillRectangle($br,1,5,14,1); $br.Dispose()
+    # Barra settimana (righe 6-9, larghezza max 14px)
     $wW = [math]::Max(1,[math]::Round($pctWeek/100*14))
-    $br = New-Object System.Drawing.SolidBrush((BarColor $pctWeek))
-    $g.FillRectangle($br,1,9,$wW,6); $br.Dispose()
+    $br = New-Object System.Drawing.SolidBrush((BarColor $pctWeek $deltaWeek))
+    $g.FillRectangle($br,1,6,$wW,4); $br.Dispose()
+    $br = New-Object System.Drawing.SolidBrush($sepColor); $g.FillRectangle($br,1,10,14,1); $br.Dispose()
+    # Barra Fable (righe 11-14, larghezza max 14px) - vuota se il dato non e' disponibile
+    if ($null -ne $pctFable) {
+        $wF = [math]::Max(1,[math]::Round($pctFable/100*14))
+        $br = New-Object System.Drawing.SolidBrush((BarColor $pctFable $deltaFable))
+        $g.FillRectangle($br,1,11,$wF,4); $br.Dispose()
+    }
     $g.Dispose()
     $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
     $bmp.Dispose()
@@ -899,33 +1838,44 @@ function Update-Tray {
     $s = $script:stats
     if ($s.Error) {
         $text = "Claude Code - $($s.Error)"
-        $tray.Text = $text.Substring(0,[Math]::Min(127,$text.Length))
+        # NotifyIcon.Text ha un limite fisso di 63 caratteri (API Windows) - oltre lancia
+        # un'eccezione. Sulla primissima chiamata (riga ~1273) nessun try/catch la ferma
+        # e lo script termina: e' la causa dei crash all'avvio con rete/DNS non pronti.
+        $tray.Text = $text.Substring(0,[Math]::Min(63,$text.Length))
         return
     }
     $sp  = if ($null -ne $s.Session.Utilization) { "$($s.Session.Utilization)%" } else { "?" }
     $wp  = if ($null -ne $s.Week.Utilization)    { "$($s.Week.Utilization)%" }    else { "?" }
+    $fPctVal = if ($s.Model -and $null -ne $s.Model.Utilization) { [double]$s.Model.Utilization } else { $null }
+    $fp  = if ($null -ne $fPctVal) { "$fPctVal%" } else { $null }
     $upd = if ($s.LastUpdated) { $s.LastUpdated.ToString("dd/MM HH:mm") } else { "mai" }
     $isPeak    = Get-IsPeakHour
     $peakTag   = if ($isPeak) { " | PEAK" } else { " | off-peak" }
     $sourceTag = if ($s.Source -eq "live") { " [live]" } else { "" }
-    $text = "Claude  Sess:$sp | Week:$wp$peakTag$sourceTag | $upd"
-    $tray.Text = $text.Substring(0,[Math]::Min(127,$text.Length))
+    $fableTag  = if ($fp) { " | Fable:$fp" } else { "" }
+    $text = "Claude  Sess:$sp | Week:$wp$fableTag$peakTag$sourceTag | $upd"
+    $tray.Text = $text.Substring(0,[Math]::Min(63,$text.Length))
 
     $sPct   = if ($null -ne $s.Session.Utilization) { [double]$s.Session.Utilization } else { 0.0 }
     $wPct   = if ($null -ne $s.Week.Utilization)    { [double]$s.Week.Utilization }    else { 0.0 }
     $maxPct = [math]::Max($sPct, $wPct)
-    $sR = [math]::Round($sPct); $wR = [math]::Round($wPct)
-    if ($sR -ne $script:lastSessPct -or $wR -ne $script:lastWeekPct -or $isPeak -ne $script:lastIconPeak) {
-        $script:lastSessPct  = $sR
-        $script:lastWeekPct  = $wR
-        $script:lastIconPeak = $isPeak
-        $newIcon = New-TrayIcon $sPct $wPct $isPeak
-        if ($script:lastIconHandle -ne [IntPtr]::Zero) {
-            try { [Win32.NativeMethods]::DestroyIcon($script:lastIconHandle) | Out-Null } catch { }
-        }
-        $script:lastIconHandle = $newIcon.Handle
-        $tray.Icon = $newIcon
+    # Scostamento dal ritmo atteso (pacing), usato per colorare icona e dashboard
+    $sPace  = if ($s.Session.ResetsAt) { Get-Pace $sPct $s.Session.ResetsAt 5 } else { $null }
+    $wPace  = if ($s.Week.ResetsAt)    { Get-Pace $wPct $s.Week.ResetsAt 168 } else { $null }
+    $fPace  = if ($null -ne $fPctVal -and $s.Model.ResetsAt) { Get-Pace $fPctVal $s.Model.ResetsAt 168 } else { $null }
+    $sDelta = if ($sPace) { $sPace.Delta } else { 0 }
+    $wDelta = if ($wPace) { $wPace.Delta } else { 0 }
+    $fDelta = if ($fPace) { $fPace.Delta } else { 0 }
+    # Ridisegno sempre ad ogni refresh (ogni 5 min): il colore dipende dal delta di
+    # pacing, che si sposta anche a % ferma (il "previsto" avanza col tempo) - un
+    # confronto sulla sola % lasciava l'icona bloccata sul colore del refresh
+    # precedente anche quando lo scostamento era nel frattempo rientrato.
+    $newIcon = New-TrayIcon $sPct $sDelta $wPct $wDelta $isPeak $fPctVal $fDelta
+    if ($script:lastIconHandle -ne [IntPtr]::Zero) {
+        try { [Win32.NativeMethods]::DestroyIcon($script:lastIconHandle) | Out-Null } catch { }
     }
+    $script:lastIconHandle = $newIcon.Handle
+    $tray.Icon = $newIcon
     if ($maxPct -ge 90 -and -not $script:notified90) {
         $script:notified90 = $true
         $tray.ShowBalloonTip(8000,"Claude Code - Limit almost reached","Usage at $([math]::Round($maxPct,1))%",[System.Windows.Forms.ToolTipIcon]::Warning)
@@ -964,6 +1914,7 @@ function Update-Tray {
             last_updated  = if ($s.LastUpdated) { $s.LastUpdated.ToString("o") } else { $null }
             session       = $null
             week          = $null
+            model         = $null
             extra_usage   = [bool]$s.ExtraUsage
             peak          = $null
         }
@@ -974,6 +1925,15 @@ function Update-Tray {
                 pct           = [double]$s.Session.Utilization
                 resets_at     = if ($rst) { $rst.ToString("o") } else { $null }
                 resets_in_min = $rim
+                expected_pct  = $null
+                delta_pct     = $null
+                pace_label    = $null
+            }
+            $pace = Get-Pace ([double]$s.Session.Utilization) $rst 5
+            if ($pace) {
+                $snap.session.expected_pct = $pace.Expected
+                $snap.session.delta_pct    = $pace.Delta
+                $snap.session.pace_label   = if ([math]::Abs($pace.Delta) -lt 3) { "on_track" } elseif ($pace.Delta -gt 0) { "over_pace" } else { "under_pace" }
             }
         }
         if ($null -ne $s.Week.Utilization) {
@@ -999,6 +1959,23 @@ function Update-Tray {
                 $wd.pace_label   = $pace
             }
             $snap.week = $wd
+        }
+        if ($s.Model -and $null -ne $s.Model.Utilization) {
+            $rst = $s.Model.ResetsAt
+            $snap.model = [ordered]@{
+                name         = $s.Model.Name
+                pct          = [double]$s.Model.Utilization
+                resets_at    = if ($rst) { $rst.ToString("o") } else { $null }
+                expected_pct = $null
+                delta_pct    = $null
+                pace_label   = $null
+            }
+            $pace = Get-Pace ([double]$s.Model.Utilization) $rst 168
+            if ($pace) {
+                $snap.model.expected_pct = $pace.Expected
+                $snap.model.delta_pct    = $pace.Delta
+                $snap.model.pace_label   = if ([math]::Abs($pace.Delta) -lt 3) { "on_track" } elseif ($pace.Delta -gt 0) { "over_pace" } else { "under_pace" }
+            }
         }
         # Peak hours (replica della logica di Build-Menu)
         $ptNow  = Get-PacificTime
@@ -1028,15 +2005,42 @@ function Update-Tray {
         }
         $snap.peak = $pk
 
+        $snap.last_fresh_fetch = if ($script:LastFreshTime) { $script:LastFreshTime.ToString("o") } else { $null }
         $snapPath = Join-Path $PSScriptRoot "usage-snapshot.json"
         [System.IO.File]::WriteAllText($snapPath, ($snap | ConvertTo-Json -Depth 5), [System.Text.Encoding]::UTF8)
+        try {
+            $nowUtc = [datetime]::UtcNow
+            $tsVal = $snap.ts
+            if ((-not $script:LastHistoryAppendTime -or ($nowUtc - $script:LastHistoryAppendTime).TotalSeconds -ge 110) -and $tsVal -ne $script:LastHistoryTs) {
+                $histPath = Join-Path $PSScriptRoot "usage-history.jsonl"
+                $histLine = $snap | ConvertTo-Json -Compress -Depth 5
+                [System.IO.File]::AppendAllText($histPath, $histLine + "`n", (New-Object System.Text.UTF8Encoding $false))
+                $script:LastHistoryAppendTime = $nowUtc
+                $script:LastHistoryTs = $tsVal
+            }
+        } catch {}
     } catch {
         "$([datetime]::Now) snapshot ERRORE: $_" | Out-File $LogFile -Append -Encoding UTF8
     }
 }
-Update-Tray
+# Rete rinforzo: la primissima chiamata (all'avvio, es. subito dopo login Windows
+# con DNS non ancora pronto) non va protetta dal try/catch di DoRefresh - senza
+# questo, un'eccezione qui terminava l'intero script prima di mostrare l'icona.
+Seed-LastGoodStats
+try { Update-Tray } catch {
+    "$([datetime]::Now) Update-Tray iniziale ERRORE: $_`n$($_.ScriptStackTrace)" | Out-File $LogFile -Append -Encoding UTF8
+}
 
 $script:DoShowHistory = { Show-HistoryChart }
+
+$script:DoOpenLedger = {
+    $ledgerPath = "C:\Claude Projects\Ottimizza Token\usage-ledger\dashboard.html"
+    if (Test-Path $ledgerPath) {
+        Start-Process $ledgerPath
+    } else {
+        $tray.ShowBalloonTip(5000,"Claude Code",'dashboard non ancora generata: lancia run_all.py',[System.Windows.Forms.ToolTipIcon]::Info)
+    }
+}
 
 # DoRefresh: aggiorna dati API e icona (chiamato da timer e "Aggiorna ora")
 $script:DoRefresh = {
@@ -1056,23 +2060,33 @@ $script:DoExit = {
 }
 
 $script:menuObj.History.add_Click($script:DoShowHistory)
+$script:menuObj.Ledger.add_Click($script:DoOpenLedger)
 $script:menuObj.Refresh.add_Click($script:DoRefresh)
+if ($script:menuObj.Stale) { $script:menuObj.Stale.add_Click($script:DoLogin) }
 $script:menuObj.Exit.add_Click($script:DoExit)
 
 $tray.add_MouseClick({
     param($s,$e)
+    try {
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
         [Win32.NativeMethods]::SetForegroundWindow($script:hiddenForm.Handle) | Out-Null
         # Ricostruisce menu da cache (nessuna chiamata API)
         $old = $script:menuObj
         $script:menuObj = Build-Menu $script:stats
         $script:menuObj.History.add_Click($script:DoShowHistory)
+        $script:menuObj.Ledger.add_Click($script:DoOpenLedger)
         $script:menuObj.Refresh.add_Click($script:DoRefresh)
+        if ($script:menuObj.Stale) { $script:menuObj.Stale.add_Click($script:DoLogin) }
         $script:menuObj.Exit.add_Click($script:DoExit)
         if ($old) { $old.Menu.Dispose() }
-        # Mostra nel punto corretto (PointToClient converte coord schermo → client)
-        $pos = $script:hiddenForm.PointToClient([System.Windows.Forms.Cursor]::Position)
-        $script:menuObj.Menu.Show($script:hiddenForm, $pos)
+        # Monitor impilati in verticale: il menu aperto verso il basso dal
+        # cursore sconfina sul monitor sotto. Apertura forzata verso l'alto,
+        # ancorata dentro l'area di lavoro del monitor primario.
+        $pos = [System.Windows.Forms.Cursor]::Position
+        $wa  = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $x = [math]::Max($wa.Left, [math]::Min($pos.X, $wa.Right  - 1))
+        $y = [math]::Max($wa.Top,  [math]::Min($pos.Y, $wa.Bottom - 1))
+        $script:menuObj.Menu.Show((New-Object System.Drawing.Point($x,$y)), [System.Windows.Forms.ToolStripDropDownDirection]::AboveLeft)
     } elseif ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
         $st = $script:stats
         $msg = if ($st.Error) { $st.Error } else {
@@ -1084,6 +2098,9 @@ $tray.add_MouseClick({
         }
         $s.ShowBalloonTip(5000,"Claude Code /usage",$msg,[System.Windows.Forms.ToolTipIcon]::Info)
     }
+    } catch {
+        "$([datetime]::Now) MouseClick ERRORE: $_`n$($_.ScriptStackTrace)" | Out-File $LogFile -Append -Encoding UTF8
+    }
 })
 
 # Auto-refresh ogni 5 minuti
@@ -1091,6 +2108,16 @@ $script:refreshTimer = New-Object System.Windows.Forms.Timer
 $script:refreshTimer.Interval = 300000
 $script:refreshTimer.add_Tick({ & $script:DoRefresh })
 $script:refreshTimer.Start()
+
+# Reti di sicurezza: logga eccezioni UI e di dominio invece di morire in silenzio
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender,$ev)
+    "$([datetime]::Now) ThreadException: $($ev.Exception)" | Out-File $LogFile -Append -Encoding UTF8
+})
+[System.AppDomain]::CurrentDomain.add_UnhandledException({
+    param($sender,$ev)
+    "$([datetime]::Now) UnhandledException: $($ev.ExceptionObject)" | Out-File $LogFile -Append -Encoding UTF8
+})
 
 [System.Windows.Forms.Application]::Run()
 

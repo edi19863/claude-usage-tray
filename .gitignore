@@ -16,3 +16,29 @@ CLAUDE.md
 .claudeignore
 .claude/
 installa-avvio-automatico.bat
+
+# --- backup: esclusioni standard ---
+.env
+.env.*
+!.env.example
+*.credentials*
+*token*.txt*
+*.pem
+*.key
+node_modules/
+venv/
+.venv/
+*-venv/
+__pycache__/
+*.pyc
+*.log
+*.bak*
+*.db
+*.db-*
+*.sqlite*
+.claude/settings.local.json
+
+# --- dati personali / generati: non pubblicare ---
+usage-history.jsonl
+.understand-anything/
+/nul
