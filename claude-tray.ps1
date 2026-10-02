@@ -1488,6 +1488,11 @@ function Invoke-TokenRefresh([bool]$force = $false) {
             -Headers @{ "User-Agent"="claude-code/2.1.78"; "anthropic-beta"="oauth-2025-04-20" } `
             -Body $body -UseBasicParsing -ErrorAction Stop
         $data = $resp.Content | ConvertFrom-Json
+        # Esperimento 01/10: annota i campi non segreti della risposta (mai i token) per capire se la scadenza del rinnovo si sposta
+        try {
+            $diag = ($data.PSObject.Properties | Where-Object { $_.Name -notin @('access_token','refresh_token') -and $_.Value -isnot [System.Management.Automation.PSCustomObject] } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' | '
+            Add-Content -Path "C:\Claude Projects\ClaudeUsageTray\refresh-diag.log" -Value ("{0} campi_risposta: {1} | nomi: {2} | refreshTokenExpiresAt_file={3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $diag, (($data.PSObject.Properties.Name) -join ','), $creds.refreshTokenExpiresAt) -Encoding UTF8
+        } catch { }
         $all  = Read-JsonFile $CredFile
         $nowMs= [long](([datetime]::UtcNow - [datetime]'1970-01-01').TotalMilliseconds)
         $all.claudeAiOauth.accessToken  = $data.access_token
